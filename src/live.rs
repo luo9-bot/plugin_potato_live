@@ -729,12 +729,12 @@ fn format_offline_message(name: &str, room_id: u64) -> String {
     format!(
         "{}下播啦！\n\n\
         ⏱ 本次：{}\n\
-        📅 今日累计：{}\n\
-        🔥 连续开播：{}\n\
-        📈 本周：{}\n\
-        🗓 本月：{}\n\
-        🏆 最长纪录：{}（{}）\n\
-        ⏰ 平均开播：{}",
+        今日累计：{}\n\
+        连续开播：{}\n\
+        本周：{}\n\
+        本月：{}\n\
+        最长纪录：{}（{}）\n\
+        平均开播：{}",
         name, duration_str, today_str, streak_str,
         week_str, month_str, longest_hours, longest_date, avg_start_str
     )
