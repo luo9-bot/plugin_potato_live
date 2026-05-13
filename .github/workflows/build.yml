@@ -1,0 +1,232 @@
+# Luo9 插件标准构建 workflow
+# 无需修改此文件，所有信息自动从 Cargo.toml 读取
+# 修改 description 字段即可更新 Release 显示名称
+name: Build Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: 构建 Release
+        run: cargo build --release
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-linux
+          path: target/release/*.so
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: 构建 Release
+        run: cargo build --release
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-windows
+          path: |
+            target/release/*.dll
+            target/release/*.dll.lib
+          if-no-files-found: error
+          retention-days: 7
+
+  create-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 读取 Cargo.toml 信息
+        id: meta
+        run: |
+          CRATE_NAME=$(grep '^name' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          DESCRIPTION=$(grep '^description' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          [ -z "$DESCRIPTION" ] && DESCRIPTION="$CRATE_NAME"
+          echo "crate_name=$CRATE_NAME" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+
+      - name: 提取版本号
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: 生成 Release Notes
+        run: |
+          cat > RELEASE_NOTES.md << EOF
+          # ${{ steps.meta.outputs.description }} v${{ steps.version.outputs.version }}
+
+          ## 安装
+          将对应平台的动态库文件复制到 Luo9 Bot 插件目录即可。
+          EOF
+
+          if [ -f "CHANGELOG.md" ]; then
+            echo "" >> RELEASE_NOTES.md
+            echo "## 变更日志" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            cat CHANGELOG.md >> RELEASE_NOTES.md
+          fi
+
+      - name: 判断是否为预发布
+        id: prerelease
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == *"alpha"* ]] || [[ "$TAG" == *"beta"* ]] || [[ "$TAG" == *"rc"* ]] || [[ "$TAG" == *"pre"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.meta.outputs.description }} ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            artifacts/plugin-linux/*
+            artifacts/plugin-windows/*
+          draft: false
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-registry:
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    # 仅非预发布版本通知注册表
+    if: needs.create-release.result == 'success' && !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') && !contains(github.ref_name, 'pre')
+    steps:
+      - name: Checkout 插件仓库
+        uses: actions/checkout@v4
+
+      - name: 获取 App Token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: registry
+
+      - name: 读取 Cargo.toml 信息
+        id: meta
+        run: |
+          CRATE_NAME=$(grep '^name' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          DESCRIPTION=$(grep '^description' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          SDK_VERSION=$(grep 'luo9_sdk' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          TAGS=$(sed -n '/\[package\.metadata\]/,/^\[/p' Cargo.toml | grep '^tags' | sed 's/^tags *= *//')
+          [ -z "$TAGS" ] && TAGS="[]"
+          [ -z "$DESCRIPTION" ] && DESCRIPTION="$CRATE_NAME"
+          [ -z "$SDK_VERSION" ] && SDK_VERSION="unknown"
+          echo "crate_name=$CRATE_NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "sdk_version=$SDK_VERSION" >> $GITHUB_OUTPUT
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+      - name: 通知注册表
+        run: |
+          TAG="v${{ steps.meta.outputs.version }}"
+          CRATE_NAME="${{ steps.meta.outputs.crate_name }}"
+
+          curl -X POST \
+            -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/luo9-bot/registry/dispatches \
+            -d "$(jq -n \
+              --arg event "plugin-publish" \
+              --arg name "$CRATE_NAME" \
+              --arg version "${{ steps.meta.outputs.version }}" \
+              --arg description "${{ steps.meta.outputs.description }}" \
+              --arg sdk_version "${{ steps.meta.outputs.sdk_version }}" \
+              --arg tag "$TAG" \
+              --arg repo "${{ github.repository }}" \
+              --arg windows "${CRATE_NAME}.dll" \
+              --arg linux "lib${CRATE_NAME}.so" \
+              --argjson tags '${{ steps.meta.outputs.tags }}' \
+              '{
+                event_type: $event,
+                client_payload: {
+                  name: $name,
+                  version: $version,
+                  description: $description,
+                  sdk_version: $sdk_version,
+                  tag: $tag,
+                  repo: $repo,
+                  tags: $tags,
+                  assets: {
+                    "windows-x86_64": $windows,
+                    "linux-x86_64": $linux
+                  }
+                }
+              }')"
+
+  cleanup:
+    needs: [create-release, notify-registry]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: 清理 CI 产物
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            plugin-linux
+            plugin-windows
+          failOnError: false
