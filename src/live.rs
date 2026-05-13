@@ -31,6 +31,20 @@ pub struct LiveMonitorConfig {
     pub admin: u64,
     pub rooms: Vec<LiveRoom>,
     pub push_groups: Vec<u64>,
+    /// 是否推送开播通知（默认 true）
+    #[serde(default = "default_true")]
+    pub push_on_start: bool,
+    /// 是否推送下播通知（默认 false）
+    #[serde(default = "default_false")]
+    pub push_on_end: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -68,6 +82,8 @@ impl Default for LiveMonitorConfig {
                 }
             ],
             push_groups: vec![123456789],
+            push_on_start: true,
+            push_on_end: false,
         }
     }
 }
@@ -79,6 +95,10 @@ rooms:
     name: "土豆"              # 主播名称
 push_groups:
   - 123456789                # 推送的群号
+
+# 推送开关（默认 true，设为 false 可关闭对应通知）
+push_on_start: true          # 开播推送
+push_on_end: false            # 下播推送（含详细统计）
 "#;
 
 // ── 数据模型 ──────────────────────────────────────────────
@@ -545,6 +565,7 @@ fn fmt_average_start_time(minutes: u32) -> String {
 fn check_and_notify(room_id: u64, name: &str) {
     let status = get_live_status(room_id);
     let mut runtime = load_runtime_state(room_id);
+    let config = CONFIG.get().expect("CONFIG not initialized");
 
     match status {
         Some(1) => {
@@ -557,8 +578,10 @@ fn check_and_notify(room_id: u64, name: &str) {
                 runtime.current_start = Some(now.to_rfc3339());
                 save_runtime_state(&runtime);
 
-                let msg = format!("{}开播啦！", name);
-                push_to_all_groups(&msg);
+                if config.push_on_start {
+                    let msg = format!("{}开播啦！", name);
+                    push_to_all_groups(&msg);
+                }
                 tracing::info!(
                     "[live_monitor] 开播: room={}, time={}",
                     room_id, now.to_rfc3339()
@@ -595,8 +618,10 @@ fn check_and_notify(room_id: u64, name: &str) {
                     append_session(&session);
                     recompute_aggregate(room_id);
 
-                    let msg = format_offline_message(name, room_id);
-                    push_to_all_groups(&msg);
+                    if config.push_on_end {
+                        let msg = format_offline_message(name, room_id);
+                        push_to_all_groups(&msg);
+                    }
                     tracing::info!(
                         "[live_monitor] 下播: room={}, 时长={}s",
                         room_id, duration_secs
