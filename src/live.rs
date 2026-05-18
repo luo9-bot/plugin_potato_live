@@ -615,57 +615,499 @@ fn get_today_sessions(sessions: &[LiveSession]) -> Vec<&LiveSession> {
         .collect()
 }
 
-/// 构建周报/月报/年报中的按日分布数据（每天多少小时）
-#[allow(dead_code)]
-fn build_daily_breakdown(sessions: &[LiveSession], start_date: NaiveDate, end_date: NaiveDate) -> Vec<serde_json::Value> {
-    let mut breakdown = Vec::new();
-    let mut current = start_date;
-    while current <= end_date {
-        let day_secs: u64 = sessions.iter()
-            .filter_map(|s| {
-                let s_start = parse_datetime(&s.start)?;
-                let s_end = parse_datetime(&s.end)?;
-                Some((s_start, s_end, s.duration_secs))
-            })
-            .flat_map(|(start, end, _)| split_session_by_day(&start, &end))
-            .filter(|(date, _)| *date == current)
-            .map(|(_, secs)| secs)
-            .sum();
+/// 对一场直播按天拆分，返回每天的具体时段信息（用于周报/月报的 daily_stats）
+/// 对于跨日场次（如 19:00→02:00），会正确拆分为：
+///   Day1: start_time="19:00", end_time="24:00", duration_minutes=300, crosses_midnight=true
+///   Day2: start_time="00:00", end_time="02:00", duration_minutes=120, crosses_midnight=true
+fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> {
+    let start_dt = match parse_datetime(&session.start) {
+        Some(dt) => dt,
+        None => return Vec::new(),
+    };
+    let end_dt = match parse_datetime(&session.end) {
+        Some(dt) => dt,
+        None => return Vec::new(),
+    };
 
-        if day_secs > 0 {
-            breakdown.push(serde_json::json!({
-                "date": current.format("%Y-%m-%d").to_string(),
-                "hours": (day_secs as f64 / 3600.0 * 100.0).round() / 100.0
-            }));
-        }
+    let start_date = start_dt.date_naive();
+    let end_date = end_dt.date_naive();
+    let original_crosses = start_date != end_date;
+
+    if start_date == end_date {
+        // 同一天，无需拆分
+        let start_min = start_dt.hour() as u64 * 60 + start_dt.minute() as u64;
+        let end_min = end_dt.hour() as u64 * 60 + end_dt.minute() as u64;
+        return vec![serde_json::json!({
+            "start_time": start_dt.format("%H:%M").to_string(),
+            "end_time": end_dt.format("%H:%M").to_string(),
+            "duration_minutes": end_min - start_min,
+            "crosses_midnight": false,
+        })];
+    }
+
+    let mut segments = Vec::new();
+
+    // 第一天：start → 24:00
+    {
+        let start_min = start_dt.hour() as u64 * 60 + start_dt.minute() as u64;
+        let day_end_min = 24 * 60;
+        segments.push(serde_json::json!({
+            "start_time": start_dt.format("%H:%M").to_string(),
+            "end_time": "24:00".to_string(),
+            "duration_minutes": day_end_min - start_min,
+            "crosses_midnight": original_crosses,
+        }));
+    }
+
+    // 中间完整天
+    let mut current = start_date + Duration::days(1);
+    while current < end_date {
+        segments.push(serde_json::json!({
+            "start_time": "00:00".to_string(),
+            "end_time": "24:00".to_string(),
+            "duration_minutes": 1440,
+            "crosses_midnight": original_crosses,
+        }));
         current += Duration::days(1);
     }
-    breakdown
+
+    // 最后一天：00:00 → end
+    {
+        let end_min = end_dt.hour() as u64 * 60 + end_dt.minute() as u64;
+        segments.push(serde_json::json!({
+            "start_time": "00:00".to_string(),
+            "end_time": end_dt.format("%H:%M").to_string(),
+            "duration_minutes": end_min,
+            "crosses_midnight": original_crosses,
+        }));
+    }
+
+    segments
 }
 
-/// 构建时段分布（凌晨/上午/下午/晚上各多少小时）
-#[allow(dead_code)]
-fn build_time_period_distribution(sessions: &[LiveSession]) -> serde_json::Value {
-    let mut periods = vec![0.0f64; 4]; // 凌晨, 上午, 下午, 晚上
+/// 计算指定时间范围内各小时的直播总分钟数（0-23）
+fn compute_hour_distribution(sessions: &[&LiveSession], start: NaiveDate, end: NaiveDate) -> [u64; 24] {
+    let mut hours = [0u64; 24];
 
-    for s in sessions {
-        if let Some(start) = parse_datetime(&s.start) {
-            if let Some(end) = parse_datetime(&s.end) {
-                let splits = split_session_by_day(&start, &end);
-                for (_date, secs) in splits {
-                    let hours = secs as f64 / 3600.0;
-                    // 粗略按该日 00:00 分配，跨日部分在次日统计
-                    periods[3] += hours; // 默认归入晚上
+    for session in sessions {
+        let start_dt = match parse_datetime(&session.start) {
+            Some(dt) => dt,
+            None => continue,
+        };
+        let end_dt = match parse_datetime(&session.end) {
+            Some(dt) => dt,
+            None => continue,
+        };
+
+        if end_dt.date_naive() < start || start_dt.date_naive() > end {
+            continue;
+        }
+
+        let segments = split_session_into_segments(session);
+        for seg in segments {
+            let start_str = seg["start_time"].as_str().unwrap_or("00:00");
+            let end_str = seg["end_time"].as_str().unwrap_or("00:00");
+
+            let parts: Vec<&str> = start_str.split(':').collect();
+            let start_hour: usize = parts[0].parse().unwrap_or(0);
+            let start_min: u64 = parts[1].parse().unwrap_or(0);
+
+            if end_str == "24:00" {
+                if start_min > 0 {
+                    hours[start_hour] += 60 - start_min;
+                    for h in (start_hour + 1)..24 {
+                        hours[h] += 60;
+                    }
+                } else {
+                    for h in start_hour..24 {
+                        hours[h] += 60;
+                    }
+                }
+            } else {
+                let end_parts: Vec<&str> = end_str.split(':').collect();
+                let end_hour: usize = end_parts[0].parse().unwrap_or(0);
+                let end_min: u64 = end_parts[1].parse().unwrap_or(0);
+
+                if start_hour == end_hour {
+                    hours[start_hour] += end_min - start_min;
+                } else {
+                    hours[start_hour] += 60 - start_min;
+                    for h in (start_hour + 1)..end_hour {
+                        hours[h] += 60;
+                    }
+                    hours[end_hour] += end_min;
                 }
             }
         }
     }
 
+    hours
+}
+
+/// 计算峰值时段（直播分钟数最多的小时），返回 (hour, minutes)
+fn compute_peak_hour(hour_dist: &[u64; 24]) -> (u32, u64) {
+    let mut peak_hour = 0u32;
+    let mut peak_min = 0u64;
+    for (h, &m) in hour_dist.iter().enumerate() {
+        if m > peak_min {
+            peak_min = m;
+            peak_hour = h as u32;
+        }
+    }
+    (peak_hour, peak_min)
+}
+
+/// 计算星期分布（7天，从周一开始，每个元素是该天的总分钟数）
+fn compute_weekday_distribution(sessions: &[&LiveSession]) -> [u64; 7] {
+    let mut dist = [0u64; 7];
+    for session in sessions {
+        let segments = split_session_into_segments(session);
+        // 拿到 session 的日期列表以匹配 weekday
+        let dates = get_session_dates(session);
+        for (i, seg) in segments.iter().enumerate() {
+            if let Some(date) = dates.get(i) {
+                let wday = date.weekday().num_days_from_monday() as usize;
+                if let Some(min) = seg["duration_minutes"].as_u64() {
+                    dist[wday] += min;
+                }
+            }
+        }
+    }
+    dist
+}
+
+/// 计算历史最长连续开播天数（从所有 session 中统计）
+fn compute_longest_streak(sessions: &[LiveSession]) -> u32 {
+    let mut live_dates: Vec<NaiveDate> = sessions.iter()
+        .flat_map(|s| get_session_dates(s))
+        .collect();
+    live_dates.sort();
+    live_dates.dedup();
+
+    if live_dates.is_empty() {
+        return 0;
+    }
+
+    let mut longest = 1u32;
+    let mut current = 1u32;
+    for i in 1..live_dates.len() {
+        let diff = (live_dates[i] - live_dates[i - 1]).num_days();
+        if diff == 1 {
+            current += 1;
+            if current > longest {
+                longest = current;
+            }
+        } else {
+            current = 1;
+        }
+    }
+    longest
+}
+
+/// 获取指定日期范围内的所有 session（含跨日覆盖）
+fn filter_sessions_in_range(sessions: &[LiveSession], range_start: NaiveDate, range_end: NaiveDate) -> Vec<&LiveSession> {
+    sessions.iter()
+        .filter(|s| {
+            let dates = get_session_dates(s);
+            dates.iter().any(|d| *d >= range_start && *d <= range_end)
+        })
+        .collect()
+}
+
+/// 构建周报 API 数据
+/// POST /api/report/weekly
+pub fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let now = Local::now();
+
+    let weekday = now.weekday().num_days_from_monday();
+    let week_start = now.date_naive() - Duration::days(weekday as i64);
+    let week_end = now.date_naive();
+
+    let week_sessions = filter_sessions_in_range(&all_sessions, week_start, week_end);
+    let hour_dist = compute_hour_distribution(&week_sessions, week_start, week_end);
+    let (peak_hour, peak_hour_min) = compute_peak_hour(&hour_dist);
+
+    let mut total_stream_minutes = 0u64;
+    let mut stream_days = 0u32;
+    let mut session_count = 0u32;
+    let mut longest_session_minutes = 0u64;
+    let mut daily_stats = Vec::new();
+
+    // 遍历周一到周日（共7天）
+    let mut current = week_start;
+    while current <= week_end {
+        let day_sessions: Vec<&LiveSession> = week_sessions.iter()
+            .filter(|s| get_session_dates(s).iter().any(|d| *d == current))
+            .copied()
+            .collect();
+
+        let mut day_total_minutes = 0u64;
+        let mut day_sessions_json = Vec::new();
+
+        for &s in &day_sessions {
+            // 获取该 session 在当天的拆分片段
+            let all_segments = split_session_into_segments(s);
+            let day_seg_opt = {
+                let dates = get_session_dates(s);
+                let mut found = None;
+                for (i, date) in dates.iter().enumerate() {
+                    if *date == current {
+                        found = all_segments.get(i);
+                        break;
+                    }
+                }
+                found
+            };
+
+            if let Some(seg) = day_seg_opt {
+                let dur_min = seg["duration_minutes"].as_u64().unwrap_or(0);
+                day_total_minutes += dur_min;
+                day_sessions_json.push(seg.clone());
+                if dur_min > longest_session_minutes {
+                    longest_session_minutes = dur_min;
+                }
+            }
+        }
+
+        if day_total_minutes > 0 {
+            stream_days += 1;
+        }
+        total_stream_minutes += day_total_minutes;
+        session_count += day_sessions.len() as u32;
+
+        daily_stats.push(serde_json::json!({
+            "date": current.format("%Y-%m-%d").to_string(),
+            "total_minutes": day_total_minutes,
+            "session_count": day_sessions.len(),
+            "sessions": day_sessions_json,
+        }));
+
+        current += Duration::days(1);
+    }
+
     serde_json::json!({
-        "dawn": (periods[0] * 100.0).round() / 100.0,
-        "morning": (periods[1] * 100.0).round() / 100.0,
-        "afternoon": (periods[2] * 100.0).round() / 100.0,
-        "evening": (periods[3] * 100.0).round() / 100.0,
+        "streamer_name": name,
+        "week_start": week_start.format("%Y-%m-%d").to_string(),
+        "week_end": week_end.format("%Y-%m-%d").to_string(),
+        "total_stream_minutes": total_stream_minutes,
+        "stream_days": stream_days,
+        "session_count": session_count,
+        "peak_hour": peak_hour,
+        "peak_hour_minutes": peak_hour_min,
+        "longest_session_minutes": longest_session_minutes,
+        "streak_days": compute_streak(&all_sessions),
+        "daily_stats": daily_stats,
+    })
+}
+
+/// 构建月报 API 数据
+/// POST /api/report/monthly
+pub fn build_monthly_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let now = Local::now();
+
+    let month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
+    let month_end = now.date_naive();
+
+    let month_sessions = filter_sessions_in_range(&all_sessions, month_start, month_end);
+    let hour_dist = compute_hour_distribution(&month_sessions, month_start, month_end);
+    let (peak_hour, peak_hour_min) = compute_peak_hour(&hour_dist);
+    let weekday_dist = compute_weekday_distribution(&month_sessions);
+
+    let mut total_stream_minutes = 0u64;
+    let mut stream_days_set: HashSet<NaiveDate> = HashSet::new();
+    let mut session_count = 0u32;
+    let mut longest_session_minutes = 0u64;
+    let mut weekly_stats = Vec::new();
+
+    for &s in &month_sessions {
+        let dates = get_session_dates(s);
+        for d in &dates {
+            if *d >= month_start && *d <= month_end {
+                stream_days_set.insert(*d);
+            }
+        }
+        session_count += 1;
+        if s.duration_secs / 60 > longest_session_minutes {
+            longest_session_minutes = s.duration_secs as u64 / 60;
+        }
+        // 累计本月总分钟（按整个 session 算，不是只算本月部分）
+        // 但更精确应该按 split 算。用 get_session_day_seconds 按天累加
+    }
+
+    // 精确按月范围算 total
+    let mut current = month_start;
+    while current <= month_end {
+        total_stream_minutes += month_sessions.iter()
+            .map(|s| get_session_day_seconds(s, current))
+            .sum::<u64>() / 60;
+        current += Duration::days(1);
+    }
+
+    // 周统计：将本月按周拆分（可能跨月边界，但只算本月内的天）
+    current = month_start;
+    let mut week_num = 1u32;
+    while current <= month_end {
+        let week_day = current.weekday().num_days_from_monday();
+        let week_start_day = current - Duration::days(week_day as i64);
+        let week_end_day = week_start_day + Duration::days(6);
+        let week_start_clamped = if week_start_day < month_start { month_start } else { week_start_day };
+        let week_end_clamped = if week_end_day > month_end { month_end } else { week_end_day };
+
+        let week_sessions = filter_sessions_in_range(&all_sessions, week_start_clamped, week_end_clamped);
+
+        let mut week_minutes = 0u64;
+        let mut wd = week_start_clamped;
+        while wd <= week_end_clamped {
+            week_minutes += month_sessions.iter()
+                .map(|s| get_session_day_seconds(s, wd))
+                .sum::<u64>() / 60;
+            wd += Duration::days(1);
+        }
+
+        weekly_stats.push(serde_json::json!({
+            "week_number": week_num,
+            "total_minutes": week_minutes,
+            "session_count": week_sessions.len() as u32,
+        }));
+
+        current = week_end_day + Duration::days(1);
+        week_num += 1;
+    }
+
+    serde_json::json!({
+        "streamer_name": name,
+        "month": format!("{:04}-{:02}", now.year(), now.month()),
+        "total_stream_minutes": total_stream_minutes,
+        "stream_days": stream_days_set.len() as u32,
+        "session_count": session_count,
+        "peak_hour": peak_hour,
+        "peak_hour_minutes": peak_hour_min,
+        "longest_session_minutes": longest_session_minutes,
+        "streak_days": compute_streak(&all_sessions),
+        "weekly_stats": weekly_stats,
+        "weekday_distribution": weekday_dist.map(|m| serde_json::Value::from(m)).to_vec(),
+    })
+}
+
+/// 构建年度总结 API 数据
+/// POST /api/report/yearly
+pub fn build_yearly_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let now = Local::now();
+    let year = now.year();
+    let year_start = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let year_end = NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
+
+    let year_sessions = filter_sessions_in_range(&all_sessions, year_start, year_end);
+    let hour_dist = compute_hour_distribution(&year_sessions, year_start, year_end);
+    let (peak_hour, peak_hour_min) = compute_peak_hour(&hour_dist);
+    let weekday_dist = compute_weekday_distribution(&year_sessions);
+
+    let mut total_stream_minutes = 0u64;
+    let mut stream_days_set: HashSet<NaiveDate> = HashSet::new();
+    let mut session_count = 0u32;
+    let mut longest_session_minutes = 0u64;
+
+    // 按年范围精确计算
+    let mut current = year_start;
+    while current <= year_end {
+        let day_min: u64 = year_sessions.iter()
+            .map(|s| get_session_day_seconds(s, current))
+            .sum::<u64>() / 60;
+        total_stream_minutes += day_min;
+
+        let day_has_session = year_sessions.iter().any(|s| {
+            get_session_dates(s).iter().any(|d| *d == current)
+        });
+        if day_has_session {
+            stream_days_set.insert(current);
+        }
+
+        current += Duration::days(1);
+    }
+
+    for &s in &year_sessions {
+        session_count += 1;
+        if s.duration_secs as u64 / 60 > longest_session_minutes {
+            longest_session_minutes = s.duration_secs as u64 / 60;
+        }
+    }
+
+    let longest_streak = compute_longest_streak(&all_sessions);
+
+    // 逐月统计
+    let mut monthly_stats = Vec::new();
+    for m in 1..=12 {
+        let month_start = NaiveDate::from_ymd_opt(year, m, 1).unwrap();
+        let month_end = if m == 12 {
+            year_end
+        } else {
+            NaiveDate::from_ymd_opt(year, m + 1, 1).unwrap() - Duration::days(1)
+        };
+
+        let mut month_minutes = 0u64;
+        let mut month_stream_days_set: HashSet<NaiveDate> = HashSet::new();
+
+        let mut d = month_start;
+        while d <= month_end {
+            let day_min: u64 = year_sessions.iter()
+                .map(|s| get_session_day_seconds(s, d))
+                .sum::<u64>() / 60;
+            month_minutes += day_min;
+
+            let day_has = year_sessions.iter().any(|s| {
+                get_session_dates(s).iter().any(|dt| *dt == d)
+            });
+            if day_has {
+                month_stream_days_set.insert(d);
+            }
+            d += Duration::days(1);
+        }
+
+        monthly_stats.push(serde_json::json!({
+            "month": m,
+            "total_minutes": month_minutes,
+            "stream_days": month_stream_days_set.len() as u32,
+        }));
+    }
+
+    // 最活跃月份（前3）
+    let mut top_months: Vec<(u32, u64)> = monthly_stats.iter()
+        .map(|m| (m["month"].as_u64().unwrap() as u32, m["total_minutes"].as_u64().unwrap_or(0)))
+        .collect();
+    top_months.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_streaming_months: Vec<serde_json::Value> = top_months.iter()
+        .take(3)
+        .map(|(month, minutes)| serde_json::json!({
+            "month": month,
+            "total_minutes": minutes,
+        }))
+        .collect();
+
+    // weekday_distribution 完整格式
+    let weekday_dist_full: Vec<serde_json::Value> = weekday_dist.iter().enumerate()
+        .map(|(wday, &minutes)| serde_json::json!({
+            "weekday": wday,
+            "total_minutes": minutes,
+            "session_count": session_count,
+        }))
+        .collect();
+
+    serde_json::json!({
+        "streamer_name": name,
+        "year": year,
+        "total_stream_minutes": total_stream_minutes,
+        "stream_days": stream_days_set.len() as u32,
+        "session_count": session_count,
+        "peak_hour": peak_hour,
+        "peak_hour_minutes": peak_hour_min,
+        "longest_session_minutes": longest_session_minutes,
+        "longest_streak_days": longest_streak,
+        "monthly_stats": monthly_stats,
+        "top_streaming_months": top_streaming_months,
+        "weekday_distribution": weekday_dist_full,
     })
 }
 
@@ -745,79 +1187,6 @@ fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
         "total_sessions": agg.total_sessions,
         "total_hours": (agg.total_seconds as f64 / 3600.0 * 100.0).round() / 100.0,
         "average_session_hours": (agg.average_session_secs / 3600.0 * 100.0).round() / 100.0,
-    })
-}
-
-/// 构建周报完整数据
-#[allow(dead_code)]
-fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
-    let all_sessions = load_sessions(room_id);
-    let now = Local::now();
-
-    let weekday = now.weekday().num_days_from_monday();
-    let week_start = now.date_naive() - Duration::days(weekday as i64);
-    let week_end = now.date_naive();
-
-    let week_secs = compute_weekly_seconds(&all_sessions);
-    let week_days = compute_weekly_live_days(&all_sessions);
-    let breakdown = build_daily_breakdown(&all_sessions, week_start, week_end);
-
-    let avg_start = compute_average_start_minutes(&all_sessions)
-        .map(fmt_average_start_time)
-        .unwrap_or_else(|| "暂无".to_string());
-
-    serde_json::json!({
-        "report_type": "weekly",
-        "room_name": name,
-        "date_range": {
-            "start": week_start.format("%Y-%m-%d").to_string(),
-            "end": week_end.format("%Y-%m-%d").to_string()
-        },
-        "total_hours": (week_secs as f64 / 3600.0 * 100.0).round() / 100.0,
-        "live_days": week_days,
-        "daily_breakdown": breakdown,
-        "average_start_time": avg_start,
-        "streak_days": compute_streak(&all_sessions),
-    })
-}
-
-/// 构建月报完整数据
-#[allow(dead_code)]
-fn build_monthly_report_data(room_id: u64, name: &str) -> serde_json::Value {
-    let all_sessions = load_sessions(room_id);
-    let agg = load_aggregate(room_id);
-    let now = Local::now();
-
-    let month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
-    let month_end = now.date_naive();
-
-    let month_secs = compute_monthly_seconds(&all_sessions);
-    let month_days = compute_monthly_live_days(&all_sessions);
-    let breakdown = build_daily_breakdown(&all_sessions, month_start, month_end);
-
-    let avg_start = compute_average_start_minutes(&all_sessions)
-        .map(fmt_average_start_time)
-        .unwrap_or_else(|| "暂无".to_string());
-
-    serde_json::json!({
-        "report_type": "monthly",
-        "room_name": name,
-        "year": now.year(),
-        "month": now.month(),
-        "total_hours": (month_secs as f64 / 3600.0 * 100.0).round() / 100.0,
-        "live_days": month_days,
-        "session_count": all_sessions.len(),
-        "daily_breakdown": breakdown,
-        "average_daily_hours": if month_days > 0 {
-            ((month_secs as f64 / month_days as f64 / 3600.0) * 100.0).round() / 100.0
-        } else { 0.0 },
-        "average_start_time": avg_start,
-        "longest_session_hours": (agg.longest_session_secs as f64 / 3600.0 * 100.0).round() / 100.0,
-        "longest_session_date": agg.longest_session_date
-            .as_deref()
-            .and_then(|s| parse_date(s))
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default(),
     })
 }
 
