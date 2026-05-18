@@ -818,7 +818,8 @@ pub fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
 
     let weekday = now.weekday().num_days_from_monday();
     let week_start = now.date_naive() - Duration::days(weekday as i64);
-    let week_end = now.date_naive();
+    // 始终补全到周日（即使今天不是周日），保证 daily_stats 固定 7 天
+    let week_end = week_start + Duration::days(6);
 
     let week_sessions = filter_sessions_in_range(&all_sessions, week_start, week_end);
     let hour_dist = compute_hour_distribution(&week_sessions, week_start, week_end);
@@ -830,9 +831,9 @@ pub fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
     let mut longest_session_minutes = 0u64;
     let mut daily_stats = Vec::new();
 
-    // 遍历周一到周日（共7天）
+    // 遍历周一至周日，固定 7 天，无直播的天也补入空数据
     let mut current = week_start;
-    while current <= week_end {
+    for _ in 0..7 {
         let day_sessions: Vec<&LiveSession> = week_sessions.iter()
             .filter(|s| get_session_dates(s).iter().any(|d| *d == current))
             .copied()
@@ -842,7 +843,6 @@ pub fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
         let mut day_sessions_json = Vec::new();
 
         for &s in &day_sessions {
-            // 获取该 session 在当天的拆分片段
             let all_segments = split_session_into_segments(s);
             let day_seg_opt = {
                 let dates = get_session_dates(s);

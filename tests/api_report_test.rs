@@ -116,7 +116,7 @@ fn test_api_handlers() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  📋 周报 /api/report/weekly");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    let weekly = live::build_weekly_report_data(TEST_ROOM_ID, "土豆");
+    let weekly: serde_json::Value = live::build_weekly_report_data(TEST_ROOM_ID, "土豆");
     save_json("weekly_report.json", &weekly);
     {
         let (path, ok) = live::handle_weekly_query(TEST_ROOM_ID, "土豆");
