@@ -643,7 +643,7 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
 
     let mut segments = Vec::new();
 
-    // 第一天：start → 24:00
+    // 第一天：start → 24:00（标记 crosses_midnight=true，表示原 session 跨日）
     {
         let start_min = start_dt.hour() as u64 * 60 + start_dt.minute() as u64;
         let day_end_min = 24 * 60;
@@ -662,7 +662,7 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
             "start_time": "00:00".to_string(),
             "end_time": "24:00".to_string(),
             "duration_minutes": 1440,
-            "crosses_midnight": original_crosses,
+            "crosses_midnight": false,
         }));
         current += Duration::days(1);
     }
@@ -674,7 +674,7 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
             "start_time": "00:00".to_string(),
             "end_time": end_dt.format("%H:%M").to_string(),
             "duration_minutes": end_min,
-            "crosses_midnight": original_crosses,
+            "crosses_midnight": false,
         }));
     }
 
