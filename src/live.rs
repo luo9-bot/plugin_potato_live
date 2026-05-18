@@ -1528,3 +1528,339 @@ fn push_to_all_groups(msg: &str) {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
+
+// ── 单元测试 ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    // ── 辅助函数 ──────────────────────────────────────────
+
+    fn make_session(start: &str, end: &str, duration_secs: u64) -> LiveSession {
+        LiveSession {
+            room_id: 999,
+            start: start.to_string(),
+            end: end.to_string(),
+            duration_secs,
+            weekday: 0,
+            start_hour: 0,
+            end_hour: 0,
+        }
+    }
+
+    fn dt(hour: u32, min: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 5, 15, hour, min, 0)
+            .single()
+            .expect("无效时间")
+    }
+
+    // ── split_session_by_day ──────────────────────────────
+
+    /// 同一天，无需拆分
+    #[test]
+    fn test_split_same_day() {
+        let start = dt(10, 0);
+        let end = dt(14, 30);
+        let result = split_session_by_day(&start, &end);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2026, 5, 15).unwrap());
+        assert_eq!(result[0].1, 4 * 3600 + 30 * 60); // 4.5h
+    }
+
+    /// 跨日凌晨（23:00 → 02:00），应拆成两天
+    #[test]
+    fn test_split_cross_midnight() {
+        let start = Local.with_ymd_and_hms(2026, 5, 23, 23, 0, 0).single().unwrap();
+        let end = Local.with_ymd_and_hms(2026, 5, 24, 2, 0, 0).single().unwrap();
+        let result = split_session_by_day(&start, &end);
+
+        assert_eq!(result.len(), 2);
+        // Day1: 23:00 → 23:59:59 = 1h
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
+        assert_eq!(result[0].1, 3600);
+        // Day2: 00:00 → 02:00 = 2h
+        assert_eq!(result[1].0, NaiveDate::from_ymd_opt(2026, 5, 24).unwrap());
+        assert_eq!(result[1].1, 2 * 3600);
+    }
+
+    /// 跨两天半（第一天 12:00 → 第三天 06:00）
+    #[test]
+    fn test_split_multi_day() {
+        let start = Local.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).single().unwrap();
+        let end = Local.with_ymd_and_hms(2026, 5, 3, 6, 0, 0).single().unwrap();
+        let result = split_session_by_day(&start, &end);
+
+        assert_eq!(result.len(), 3);
+        // Day1: 12:00 → 23:59:59 = 12h
+        assert_eq!(result[0].0, NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+        assert_eq!(result[0].1, 12 * 3600);
+        // Day2: full day = 24h
+        assert_eq!(result[1].0, NaiveDate::from_ymd_opt(2026, 5, 2).unwrap());
+        assert_eq!(result[1].1, 24 * 3600);
+        // Day3: 00:00 → 06:00 = 6h
+        assert_eq!(result[2].0, NaiveDate::from_ymd_opt(2026, 5, 3).unwrap());
+        assert_eq!(result[2].1, 6 * 3600);
+    }
+
+    /// start >= end 返回空
+    #[test]
+    fn test_split_invalid_range() {
+        let start = dt(14, 0);
+        let end = dt(10, 0);
+        let result = split_session_by_day(&start, &end);
+        assert!(result.is_empty());
+    }
+
+    // ── split_session_into_segments ───────────────────────
+
+    /// 同天，crosses_midnight=false
+    #[test]
+    fn test_segments_same_day() {
+        let s = make_session("2026-05-15T10:00:00+08:00", "2026-05-15T14:30:00+08:00", 4 * 3600 + 30 * 60);
+        let segs = split_session_into_segments(&s);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0]["start_time"], "10:00");
+        assert_eq!(segs[0]["end_time"], "14:30");
+        assert_eq!(segs[0]["duration_minutes"], 270);
+        assert_eq!(segs[0]["crosses_midnight"], false);
+    }
+
+    /// 跨日 19:00→02:00
+    #[test]
+    fn test_segments_cross_midnight() {
+        let s = make_session("2026-01-16T19:00:00+08:00", "2026-01-17T02:00:00+08:00", 7 * 3600);
+        let segs = split_session_into_segments(&s);
+        assert_eq!(segs.len(), 2);
+
+        // Day1: 19:00 → 24:00 = 5h
+        assert_eq!(segs[0]["start_time"], "19:00");
+        assert_eq!(segs[0]["end_time"], "24:00");
+        assert_eq!(segs[0]["duration_minutes"], 300);
+        assert_eq!(segs[0]["crosses_midnight"], true);
+
+        // Day2: 00:00 → 02:00 = 2h
+        assert_eq!(segs[1]["start_time"], "00:00");
+        assert_eq!(segs[1]["end_time"], "02:00");
+        assert_eq!(segs[1]["duration_minutes"], 120);
+        assert_eq!(segs[1]["crosses_midnight"], true);
+    }
+
+    /// 跨两天 18:00→03:00（你给的例子）
+    #[test]
+    fn test_segments_cross_midnight_18_to_3() {
+        let s = make_session("2026-01-19T18:00:00+08:00", "2026-01-20T03:00:00+08:00", 9 * 3600);
+        let segs = split_session_into_segments(&s);
+        assert_eq!(segs.len(), 2);
+
+        assert_eq!(segs[0]["start_time"], "18:00");
+        assert_eq!(segs[0]["end_time"], "24:00");
+        assert_eq!(segs[0]["duration_minutes"], 360);
+        assert_eq!(segs[0]["crosses_midnight"], true);
+
+        assert_eq!(segs[1]["start_time"], "00:00");
+        assert_eq!(segs[1]["end_time"], "03:00");
+        assert_eq!(segs[1]["duration_minutes"], 180);
+        assert_eq!(segs[1]["crosses_midnight"], true);
+    }
+
+    // ── get_session_dates ─────────────────────────────────
+
+    #[test]
+    fn test_session_dates_same_day() {
+        let s = make_session("2026-05-10T08:00:00+08:00", "2026-05-10T12:00:00+08:00", 4 * 3600);
+        let dates = get_session_dates(&s);
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 5, 10).unwrap());
+    }
+
+    #[test]
+    fn test_session_dates_cross_midnight() {
+        let s = make_session("2026-05-23T23:00:00+08:00", "2026-05-24T02:00:00+08:00", 3 * 3600);
+        let dates = get_session_dates(&s);
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
+        assert_eq!(dates[1], NaiveDate::from_ymd_opt(2026, 5, 24).unwrap());
+    }
+
+    // ── get_session_day_seconds ───────────────────────────
+
+    #[test]
+    fn test_session_day_seconds_cross() {
+        let s = make_session("2026-05-23T23:00:00+08:00", "2026-05-24T02:00:00+08:00", 3 * 3600);
+        let day23 = NaiveDate::from_ymd_opt(2026, 5, 23).unwrap();
+        let day24 = NaiveDate::from_ymd_opt(2026, 5, 24).unwrap();
+        assert_eq!(get_session_day_seconds(&s, day23), 3600);
+        assert_eq!(get_session_day_seconds(&s, day24), 7200);
+    }
+
+    // ── compute_peak_hour ─────────────────────────────────
+
+    #[test]
+    fn test_peak_hour() {
+        let mut dist = [0u64; 24];
+        dist[20] = 480;  // 晚8点最多
+        dist[21] = 300;
+        dist[14] = 360;
+        let (hour, mins) = compute_peak_hour(&dist);
+        assert_eq!(hour, 20);
+        assert_eq!(mins, 480);
+    }
+
+    #[test]
+    fn test_peak_hour_all_zero() {
+        let dist = [0u64; 24];
+        let (hour, mins) = compute_peak_hour(&dist);
+        assert_eq!(hour, 0);
+        assert_eq!(mins, 0);
+    }
+
+    // ── compute_streak ────────────────────────────────────
+
+    #[test]
+    fn test_streak_consecutive() {
+        let sessions = vec![
+            make_session("2026-05-11T10:00:00+08:00", "2026-05-11T14:00:00+08:00", 4 * 3600),
+            make_session("2026-05-12T10:00:00+08:00", "2026-05-12T14:00:00+08:00", 4 * 3600),
+            make_session("2026-05-13T10:00:00+08:00", "2026-05-13T14:00:00+08:00", 4 * 3600),
+        ];
+        // compute_streak 基于 Local::now()，验证函数能正常执行即可
+        let _streak = compute_streak(&sessions);
+    }
+
+    #[test]
+    fn test_streak_empty() {
+        let sessions: Vec<LiveSession> = vec![];
+        assert_eq!(compute_streak(&sessions), 0);
+    }
+
+    // ── compute_longest_streak ────────────────────────────
+
+    #[test]
+    fn test_longest_streak_basic() {
+        let sessions = vec![
+            make_session("2026-05-10T10:00:00+08:00", "2026-05-10T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-11T10:00:00+08:00", "2026-05-11T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-12T10:00:00+08:00", "2026-05-12T12:00:00+08:00", 2 * 3600),
+            // 断一天
+            make_session("2026-05-14T10:00:00+08:00", "2026-05-14T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-15T10:00:00+08:00", "2026-05-15T12:00:00+08:00", 2 * 3600),
+        ];
+        assert_eq!(compute_longest_streak(&sessions), 3);
+    }
+
+    #[test]
+    fn test_longest_streak_cross_midnight() {
+        // 跨日场次应同时计入前后两天
+        let sessions = vec![
+            make_session("2026-05-10T22:00:00+08:00", "2026-05-11T02:00:00+08:00", 4 * 3600),
+            make_session("2026-05-11T22:00:00+08:00", "2026-05-12T02:00:00+08:00", 4 * 3600),
+            make_session("2026-05-12T22:00:00+08:00", "2026-05-13T02:00:00+08:00", 4 * 3600),
+        ];
+        // 10, 11, 12, 13 四天连续
+        assert_eq!(compute_longest_streak(&sessions), 4);
+    }
+
+    #[test]
+    fn test_longest_streak_empty() {
+        let sessions: Vec<LiveSession> = vec![];
+        assert_eq!(compute_longest_streak(&sessions), 0);
+    }
+
+    #[test]
+    fn test_longest_streak_single() {
+        let sessions = vec![
+            make_session("2026-05-10T10:00:00+08:00", "2026-05-10T12:00:00+08:00", 2 * 3600),
+        ];
+        assert_eq!(compute_longest_streak(&sessions), 1);
+    }
+
+    // ── compute_average_start_minutes ─────────────────────
+
+    #[test]
+    fn test_avg_start_minutes() {
+        let sessions = vec![
+            make_session("2026-05-10T10:00:00+08:00", "2026-05-10T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-11T14:30:00+08:00", "2026-05-11T16:00:00+08:00", 2 * 3600),
+        ];
+        let avg = compute_average_start_minutes(&sessions);
+        assert_eq!(avg, Some((10 * 60 + 14 * 60 + 30) / 2)); // (600 + 870) / 2 = 735
+        assert_eq!(avg, Some(735));
+    }
+
+    #[test]
+    fn test_avg_start_minutes_empty() {
+        let sessions: Vec<LiveSession> = vec![];
+        assert_eq!(compute_average_start_minutes(&sessions), None);
+    }
+
+    // ── fmt_hours ─────────────────────────────────────────
+
+    #[test]
+    fn test_fmt_hours() {
+        assert_eq!(fmt_hours(3600), "1.0h");
+        assert_eq!(fmt_hours(5400), "1.5h");
+        assert_eq!(fmt_hours(10800), "3.0h");
+        assert_eq!(fmt_hours(0), "0.0h");
+    }
+
+    // ── fmt_average_start_time ────────────────────────────
+
+    #[test]
+    fn test_fmt_avg_time() {
+        assert_eq!(fmt_average_start_time(600), "10:00");
+        assert_eq!(fmt_average_start_time(735), "12:15");
+        assert_eq!(fmt_average_start_time(0), "00:00");
+        assert_eq!(fmt_average_start_time(1439), "23:59");
+    }
+
+    // ── filter_sessions_in_range ──────────────────────────
+
+    #[test]
+    fn test_filter_sessions_in_range() {
+        let sessions = vec![
+            make_session("2026-05-10T10:00:00+08:00", "2026-05-10T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-15T10:00:00+08:00", "2026-05-15T12:00:00+08:00", 2 * 3600),
+            make_session("2026-05-20T10:00:00+08:00", "2026-05-20T12:00:00+08:00", 2 * 3600),
+        ];
+        let start = NaiveDate::from_ymd_opt(2026, 5, 12).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let filtered = filter_sessions_in_range(&sessions, start, end);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].start, "2026-05-15T10:00:00+08:00");
+    }
+
+    /// 跨日场次：结束日在范围内的也应被过滤到
+    #[test]
+    fn test_filter_sessions_cross_midnight() {
+        let sessions = vec![
+            make_session("2026-05-09T23:00:00+08:00", "2026-05-10T02:00:00+08:00", 3 * 3600),
+        ];
+        let start = NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let filtered = filter_sessions_in_range(&sessions, start, end);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    // ── get_today_sessions ────────────────────────────────
+
+    #[test]
+    fn test_get_today_sessions_empty() {
+        let sessions: Vec<LiveSession> = vec![];
+        let result = get_today_sessions(&sessions);
+        assert!(result.is_empty());
+    }
+
+    // ── compute_weekday_distribution ──────────────────────
+
+    #[test]
+    fn test_weekday_distribution() {
+        // 2026-05-11 是周一(0)
+        let sessions = vec![
+            make_session("2026-05-11T10:00:00+08:00", "2026-05-11T12:00:00+08:00", 2 * 3600),
+        ];
+        let dist = compute_weekday_distribution(&sessions.iter().collect::<Vec<_>>());
+        assert_eq!(dist[0], 120); // 周一 120 min
+    }
+}
