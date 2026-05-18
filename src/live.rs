@@ -37,6 +37,12 @@ pub struct LiveMonitorConfig {
     /// 是否推送下播通知（默认 false）
     #[serde(default = "default_false")]
     pub push_on_end: bool,
+    /// 报告 API 地址，用于推送直播数据生成周报/月报等（可选，不填则不推送）
+    #[serde(default)]
+    pub report_api_url: Option<String>,
+    /// 是否启用报告推送（默认 false）
+    #[serde(default = "default_false")]
+    pub report_push_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -84,6 +90,8 @@ impl Default for LiveMonitorConfig {
             push_groups: vec![123456789],
             push_on_start: true,
             push_on_end: false,
+            report_api_url: None,
+            report_push_enabled: false,
         }
     }
 }
@@ -98,7 +106,11 @@ push_groups:
 
 # 推送开关（默认 true，设为 false 可关闭对应通知）
 push_on_start: true          # 开播推送
-push_on_end: false            # 下播推送（含详细统计）
+push_on_end: false           # 下播推送（含详细统计）
+
+# 报告 API 配置（用于生成周报/月报/年度总结，可选）
+# report_api_url: "http://your-api.example.com/api/report"
+# report_push_enabled: false
 "#;
 
 // ── 数据模型 ──────────────────────────────────────────────
@@ -409,7 +421,7 @@ fn compute_weekly_live_days(sessions: &[LiveSession]) -> u32 {
     let week_start = today - Duration::days(weekday as i64);
 
     let days: HashSet<NaiveDate> = sessions.iter()
-        .filter_map(|s| parse_date(&s.start))
+        .flat_map(|s| get_session_dates(s))
         .filter(|d| *d >= week_start && *d <= today)
         .collect();
 
@@ -440,7 +452,7 @@ fn compute_monthly_live_days(sessions: &[LiveSession]) -> u32 {
     let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
 
     let days: HashSet<NaiveDate> = sessions.iter()
-        .filter_map(|s| parse_date(&s.start))
+        .flat_map(|s| get_session_dates(s))
         .filter(|d| *d >= month_start && *d <= today)
         .collect();
 
@@ -483,7 +495,7 @@ fn compute_today_seconds(sessions: &[LiveSession]) -> u64 {
 /// 计算连续开播天数（从今天往前推）
 fn compute_streak(sessions: &[LiveSession]) -> u32 {
     let mut live_dates: Vec<NaiveDate> = sessions.iter()
-        .filter_map(|s| parse_date(&s.start))
+        .flat_map(|s| get_session_dates(s))
         .collect();
     live_dates.sort();
     live_dates.dedup();
@@ -558,6 +570,404 @@ fn fmt_average_start_time(minutes: u32) -> String {
     let hour = minutes / 60;
     let minute = minutes % 60;
     format!("{:02}:{:02}", hour, minute)
+}
+
+// ── 报告数据构建 & API 请求 ─────────────────────────────
+
+/// 获取一场直播在指定日期中的秒数（跨日时取当天的占比）
+fn get_session_day_seconds(session: &LiveSession, date: NaiveDate) -> u64 {
+    let start = match parse_datetime(&session.start) {
+        Some(dt) => dt,
+        None => return 0,
+    };
+    let end = match parse_datetime(&session.end) {
+        Some(dt) => dt,
+        None => return 0,
+    };
+    split_session_by_day(&start, &end)
+        .into_iter()
+        .find(|(d, _)| *d == date)
+        .map(|(_, secs)| secs)
+        .unwrap_or(0)
+}
+
+/// 获取一场直播覆盖的所有自然日（处理跨日情况）
+fn get_session_dates(session: &LiveSession) -> Vec<NaiveDate> {
+    let start = match parse_datetime(&session.start) {
+        Some(dt) => dt,
+        None => return Vec::new(),
+    };
+    let end = match parse_datetime(&session.end) {
+        Some(dt) => dt,
+        None => return Vec::new(),
+    };
+    split_session_by_day(&start, &end)
+        .into_iter()
+        .map(|(date, _)| date)
+        .collect()
+}
+
+/// 获取今日涉及的所有直播（按自然日匹配，跨日直播也会被查到）
+fn get_today_sessions(sessions: &[LiveSession]) -> Vec<&LiveSession> {
+    let today = Local::now().date_naive();
+    sessions.iter()
+        .filter(|s| get_session_dates(s).iter().any(|d| *d == today))
+        .collect()
+}
+
+/// 构建周报/月报/年报中的按日分布数据（每天多少小时）
+#[allow(dead_code)]
+fn build_daily_breakdown(sessions: &[LiveSession], start_date: NaiveDate, end_date: NaiveDate) -> Vec<serde_json::Value> {
+    let mut breakdown = Vec::new();
+    let mut current = start_date;
+    while current <= end_date {
+        let day_secs: u64 = sessions.iter()
+            .filter_map(|s| {
+                let s_start = parse_datetime(&s.start)?;
+                let s_end = parse_datetime(&s.end)?;
+                Some((s_start, s_end, s.duration_secs))
+            })
+            .flat_map(|(start, end, _)| split_session_by_day(&start, &end))
+            .filter(|(date, _)| *date == current)
+            .map(|(_, secs)| secs)
+            .sum();
+
+        if day_secs > 0 {
+            breakdown.push(serde_json::json!({
+                "date": current.format("%Y-%m-%d").to_string(),
+                "hours": (day_secs as f64 / 3600.0 * 100.0).round() / 100.0
+            }));
+        }
+        current += Duration::days(1);
+    }
+    breakdown
+}
+
+/// 构建时段分布（凌晨/上午/下午/晚上各多少小时）
+#[allow(dead_code)]
+fn build_time_period_distribution(sessions: &[LiveSession]) -> serde_json::Value {
+    let mut periods = vec![0.0f64; 4]; // 凌晨, 上午, 下午, 晚上
+
+    for s in sessions {
+        if let Some(start) = parse_datetime(&s.start) {
+            if let Some(end) = parse_datetime(&s.end) {
+                let splits = split_session_by_day(&start, &end);
+                for (_date, secs) in splits {
+                    let hours = secs as f64 / 3600.0;
+                    // 粗略按该日 00:00 分配，跨日部分在次日统计
+                    periods[3] += hours; // 默认归入晚上
+                }
+            }
+        }
+    }
+
+    serde_json::json!({
+        "dawn": (periods[0] * 100.0).round() / 100.0,
+        "morning": (periods[1] * 100.0).round() / 100.0,
+        "afternoon": (periods[2] * 100.0).round() / 100.0,
+        "evening": (periods[3] * 100.0).round() / 100.0,
+    })
+}
+
+/// 构建日报完整数据（用于发送到 API 生成图片）
+fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let runtime = load_runtime_state(room_id);
+    let agg = load_aggregate(room_id);
+
+    let today_sessions = get_today_sessions(&all_sessions);
+
+    let now = Local::now();
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let weekday = now.weekday().num_days_from_monday();
+
+    let week_days = compute_weekly_live_days(&all_sessions);
+    let week_secs = compute_weekly_seconds(&all_sessions);
+    let month_days = compute_monthly_live_days(&all_sessions);
+    let month_secs = compute_monthly_seconds(&all_sessions);
+    let streak = compute_streak(&all_sessions);
+    let today_secs = compute_today_seconds(&all_sessions);
+
+    let avg_time = agg.average_start_minutes
+        .map(fmt_average_start_time)
+        .unwrap_or_else(|| "暂无".to_string());
+
+    // 今日各场次（跨日场次只展示今天的秒数）
+    let session_list: Vec<serde_json::Value> = today_sessions.iter().map(|s| {
+        let start = parse_datetime(&s.start)
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "??:??".to_string());
+        let end = parse_datetime(&s.end)
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "??:??".to_string());
+        let day_secs = get_session_day_seconds(s, now.date_naive());
+        serde_json::json!({
+            "start": start,
+            "end": end,
+            "duration_hours": (day_secs as f64 / 3600.0 * 100.0).round() / 100.0
+        })
+    }).collect();
+
+    // 是否正在直播
+    let (is_live, live_elapsed_hours) = if runtime.is_live {
+        let start = runtime.current_start
+            .as_deref()
+            .and_then(parse_datetime)
+            .unwrap_or(Local::now());
+        let elapsed = (Local::now() - start).num_seconds() as f64 / 3600.0;
+        (true, (elapsed * 100.0).round() / 100.0)
+    } else {
+        (false, 0.0)
+    };
+
+    serde_json::json!({
+        "report_type": "daily",
+        "room_name": name,
+        "date": today_str,
+        "weekday": weekday,
+        "is_live": is_live,
+        "live_elapsed_hours": live_elapsed_hours,
+        "sessions": session_list,
+        "daily_total_hours": (today_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "daily_session_count": today_sessions.len(),
+        "weekly_live_days": week_days,
+        "weekly_total_hours": (week_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "monthly_live_days": month_days,
+        "monthly_total_hours": (month_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "streak_days": streak,
+        "longest_session_hours": (agg.longest_session_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "longest_session_date": agg.longest_session_date
+            .as_deref()
+            .and_then(|s| parse_date(s))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+        "average_start_time": avg_time,
+        "total_sessions": agg.total_sessions,
+        "total_hours": (agg.total_seconds as f64 / 3600.0 * 100.0).round() / 100.0,
+        "average_session_hours": (agg.average_session_secs / 3600.0 * 100.0).round() / 100.0,
+    })
+}
+
+/// 构建周报完整数据
+#[allow(dead_code)]
+fn build_weekly_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let now = Local::now();
+
+    let weekday = now.weekday().num_days_from_monday();
+    let week_start = now.date_naive() - Duration::days(weekday as i64);
+    let week_end = now.date_naive();
+
+    let week_secs = compute_weekly_seconds(&all_sessions);
+    let week_days = compute_weekly_live_days(&all_sessions);
+    let breakdown = build_daily_breakdown(&all_sessions, week_start, week_end);
+
+    let avg_start = compute_average_start_minutes(&all_sessions)
+        .map(fmt_average_start_time)
+        .unwrap_or_else(|| "暂无".to_string());
+
+    serde_json::json!({
+        "report_type": "weekly",
+        "room_name": name,
+        "date_range": {
+            "start": week_start.format("%Y-%m-%d").to_string(),
+            "end": week_end.format("%Y-%m-%d").to_string()
+        },
+        "total_hours": (week_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "live_days": week_days,
+        "daily_breakdown": breakdown,
+        "average_start_time": avg_start,
+        "streak_days": compute_streak(&all_sessions),
+    })
+}
+
+/// 构建月报完整数据
+#[allow(dead_code)]
+fn build_monthly_report_data(room_id: u64, name: &str) -> serde_json::Value {
+    let all_sessions = load_sessions(room_id);
+    let agg = load_aggregate(room_id);
+    let now = Local::now();
+
+    let month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
+    let month_end = now.date_naive();
+
+    let month_secs = compute_monthly_seconds(&all_sessions);
+    let month_days = compute_monthly_live_days(&all_sessions);
+    let breakdown = build_daily_breakdown(&all_sessions, month_start, month_end);
+
+    let avg_start = compute_average_start_minutes(&all_sessions)
+        .map(fmt_average_start_time)
+        .unwrap_or_else(|| "暂无".to_string());
+
+    serde_json::json!({
+        "report_type": "monthly",
+        "room_name": name,
+        "year": now.year(),
+        "month": now.month(),
+        "total_hours": (month_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "live_days": month_days,
+        "session_count": all_sessions.len(),
+        "daily_breakdown": breakdown,
+        "average_daily_hours": if month_days > 0 {
+            ((month_secs as f64 / month_days as f64 / 3600.0) * 100.0).round() / 100.0
+        } else { 0.0 },
+        "average_start_time": avg_start,
+        "longest_session_hours": (agg.longest_session_secs as f64 / 3600.0 * 100.0).round() / 100.0,
+        "longest_session_date": agg.longest_session_date
+            .as_deref()
+            .and_then(|s| parse_date(s))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+    })
+}
+
+/// 发送报告数据到 API 并获取图片 URL
+/// 返回 None 表示失败（API 未配置、请求失败等）
+fn request_report_image(data: &serde_json::Value) -> Option<String> {
+    let config = CONFIG.get().expect("CONFIG not initialized");
+    let api_url = match &config.report_api_url {
+        Some(url) => url,
+        None => return None,
+    };
+
+    if !config.report_push_enabled {
+        return None;
+    }
+
+    let client = Client::new();
+    match client
+        .post(api_url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "PotatoLiveBot/1.0")
+        .json(data)
+        .send()
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                // 尝试从响应中提取图片 URL
+                if let Ok(json) = resp.json::<serde_json::Value>() {
+                    let url = json["image_url"].as_str()
+                        .or_else(|| json["url"].as_str())
+                        .or_else(|| json["data"]["url"].as_str())
+                        .unwrap_or("");
+                    if !url.is_empty() {
+                        return Some(url.to_string());
+                    }
+                }
+                // 如果没有 json 响应体，尝试直接作为 URL
+                tracing::info!("[live_monitor] 报告 API 请求成功但未返回图片 URL");
+                None
+            } else {
+                tracing::warn!("[live_monitor] 报告 API 返回非成功: {}", resp.status());
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[live_monitor] 报告 API 请求失败: {}", e);
+            None
+        }
+    }
+}
+
+/// 处理今日查询：优先尝试 API 获取图片，失败则回退到文本
+/// 返回 (image_url 或 text, 是否是图片)
+pub fn handle_daily_query(room_id: u64, name: &str) -> (String, bool) {
+    // 先尝试 API 生成图片
+    let data = build_daily_report_data(room_id, name);
+    if let Some(image_url) = request_report_image(&data) {
+        return (image_url, true);
+    }
+    // API 失败或无配置，回退到文本
+    let text = format_today_report(room_id, name);
+    (text, false)
+}
+
+/// 格式化今日直播报告文本（供指令回退使用）
+fn format_today_report(room_id: u64, name: &str) -> String {
+    let sessions = load_sessions(room_id);
+    let runtime = load_runtime_state(room_id);
+    let agg = load_aggregate(room_id);
+
+    let today = Local::now().date_naive();
+    let today_sessions = get_today_sessions(&sessions);
+    let today_total_secs = compute_today_seconds(&sessions);
+    let today_total_hours = today_total_secs as f64 / 3600.0;
+
+    // 是否正在直播
+    let live_status = if runtime.is_live {
+        let start = runtime.current_start
+            .as_deref()
+            .and_then(parse_datetime)
+            .unwrap_or(Local::now());
+        let elapsed = (Local::now() - start).num_seconds() as f64 / 3600.0;
+        format!("🟢 正在直播中（已播 {:.1}h）\n", elapsed)
+    } else {
+        String::new()
+    };
+
+    // 今日各场次详情（跨日场次只展示今天的占比）
+    let mut details = String::new();
+    for s in today_sessions.iter() {
+        let start = parse_datetime(&s.start)
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "??:??".to_string());
+        let end = parse_datetime(&s.end)
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "??:??".to_string());
+        let day_secs = get_session_day_seconds(s, today);
+        let hours = day_secs as f64 / 3600.0;
+        if day_secs > 0 {
+            details.push_str(&format!("  · {} → {}（{:.1}h）\n", start, end, hours));
+        }
+    }
+
+    if today_sessions.is_empty() && !runtime.is_live {
+        return format!("{}今天还没有开播哦~", name);
+    }
+
+    let today_line = if today_total_secs > 0 {
+        format!("🎯 今日累计：{:.1}h\n", today_total_hours)
+    } else {
+        String::new()
+    };
+
+    let streak = compute_streak(&sessions);
+    let week_days = compute_weekly_live_days(&sessions);
+    let week_secs = compute_weekly_seconds(&sessions);
+    let month_days = compute_monthly_live_days(&sessions);
+    let month_secs = compute_monthly_seconds(&sessions);
+
+    let longest_h = agg.longest_session_secs as f64 / 3600.0;
+    let longest_date = agg.longest_session_date
+        .as_deref()
+        .and_then(|s| parse_date(s))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "未知".to_string());
+
+    let avg_time = agg.average_start_minutes
+        .map(fmt_average_start_time)
+        .unwrap_or_else(|| "暂无".to_string());
+
+    format!(
+        "📺 {}今日直播情况\n\
+        ━━━━━━━━━━━━━━━━━━\n\
+        {}{}\
+        {}━━━━━━━━━━━━━━━━━━\n\
+        🔥 连续开播：{}天\n\
+        📈 本周：{}天 / {:.1}h\n\
+        🗓 本月：{}天 / {:.1}h\n\
+        🏆 最长纪录：{:.1}h（{}）\n\
+        ⏰ 平均开播：{}",
+        name,
+        live_status,
+        today_line,
+        details,
+        streak,
+        week_days, week_secs as f64 / 3600.0,
+        month_days, month_secs as f64 / 3600.0,
+        longest_h, longest_date,
+        avg_time,
+    )
 }
 
 // ── 核心检测逻辑 ─────────────────────────────────────────
