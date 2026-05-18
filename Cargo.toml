@@ -8,7 +8,7 @@ description = "bilibili直播检测: 土豆，今天直播了没?"
 tags = ["potato", "bilibili"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 luo9_sdk = "0.6.0"

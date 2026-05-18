@@ -37,12 +37,10 @@ pub struct LiveMonitorConfig {
     /// 是否推送下播通知（默认 false）
     #[serde(default = "default_false")]
     pub push_on_end: bool,
-    /// 报告 API 地址，用于推送直播数据生成周报/月报等（可选，不填则不推送）
+    /// 报告 API 基础地址，用于生成日报/周报/月报/年报图片（可选，不填则回退到文本）
+    /// 内部会自动拼接路径，如 /api/report/daily, /api/report/weekly 等
     #[serde(default)]
     pub report_api_url: Option<String>,
-    /// 是否启用报告推送（默认 false）
-    #[serde(default = "default_false")]
-    pub report_push_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -91,7 +89,6 @@ impl Default for LiveMonitorConfig {
             push_on_start: true,
             push_on_end: false,
             report_api_url: None,
-            report_push_enabled: false,
         }
     }
 }
@@ -108,9 +105,8 @@ push_groups:
 push_on_start: true          # 开播推送
 push_on_end: false           # 下播推送（含详细统计）
 
-# 报告 API 配置（用于生成周报/月报/年度总结，可选）
-# report_api_url: "http://your-api.example.com/api/report"
-# report_push_enabled: false
+# 报告 API 基础地址（可选，不填则日报回退到文本模式）
+# report_api_url: "https://your-api.example.com"
 "#;
 
 // ── 数据模型 ──────────────────────────────────────────────
@@ -1112,7 +1108,7 @@ pub fn build_yearly_report_data(room_id: u64, name: &str) -> serde_json::Value {
 }
 
 /// 构建日报完整数据（用于发送到 API 生成图片）
-fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
+pub fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
     let all_sessions = load_sessions(room_id);
     let runtime = load_runtime_state(room_id);
     let agg = load_aggregate(room_id);
@@ -1190,65 +1186,112 @@ fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
     })
 }
 
-/// 发送报告数据到 API 并获取图片 URL
-/// 返回 None 表示失败（API 未配置、请求失败等）
-fn request_report_image(data: &serde_json::Value) -> Option<String> {
+/// 发送报告数据到 API 并保存返回的 PNG 图片到本地
+/// `endpoint` 示例: "/api/report/weekly", "/api/report/monthly"
+/// 返回图片的本地文件路径，或 None（API 未配置 / 请求失败）
+fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<String> {
     let config = CONFIG.get().expect("CONFIG not initialized");
-    let api_url = match &config.report_api_url {
-        Some(url) => url,
+    let base_url = match &config.report_api_url {
+        Some(url) => url.trim_end_matches('/').to_string(),
         None => return None,
     };
 
-    if !config.report_push_enabled {
-        return None;
-    }
+    let api_url = format!("{}{}", base_url, endpoint);
 
     let client = Client::new();
-    match client
-        .post(api_url)
+    let resp = match client
+        .post(&api_url)
         .header("Content-Type", "application/json")
         .header("User-Agent", "PotatoLiveBot/1.0")
         .json(data)
         .send()
     {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                // 尝试从响应中提取图片 URL
-                if let Ok(json) = resp.json::<serde_json::Value>() {
-                    let url = json["image_url"].as_str()
-                        .or_else(|| json["url"].as_str())
-                        .or_else(|| json["data"]["url"].as_str())
-                        .unwrap_or("");
-                    if !url.is_empty() {
-                        return Some(url.to_string());
-                    }
-                }
-                // 如果没有 json 响应体，尝试直接作为 URL
-                tracing::info!("[live_monitor] 报告 API 请求成功但未返回图片 URL");
-                None
-            } else {
-                tracing::warn!("[live_monitor] 报告 API 返回非成功: {}", resp.status());
-                None
-            }
-        }
+        Ok(r) => r,
         Err(e) => {
-            tracing::warn!("[live_monitor] 报告 API 请求失败: {}", e);
-            None
+            tracing::warn!("[live_monitor] 报告 API 请求失败: {} -> {}", api_url, e);
+            return None;
         }
+    };
+
+    if !resp.status().is_success() {
+        tracing::warn!("[live_monitor] 报告 API 返回非成功: {} -> {}", api_url, resp.status());
+        return None;
     }
+
+    // API 返回 PNG 二进制流，直接保存到本地
+    let bytes = match resp.bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("[live_monitor] 读取响应体失败: {}", e);
+            return None;
+        }
+    };
+
+    if bytes.is_empty() {
+        tracing::warn!("[live_monitor] 报告 API 返回空响应体");
+        return None;
+    }
+
+    // 生成文件名：report_{endpoint}_{timestamp}.png
+    let endpoint_name = endpoint.trim_start_matches("/api/report/").replace('/', "_");
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("report_{}_{}.png", endpoint_name, timestamp);
+
+    let cache_dir = data_dir().join("cache");
+    if fs::create_dir_all(&cache_dir).is_err() {
+        tracing::warn!("[live_monitor] 无法创建缓存目录");
+        return None;
+    }
+
+    let file_path = cache_dir.join(&filename);
+    if fs::write(&file_path, &bytes).is_err() {
+        tracing::warn!("[live_monitor] 无法保存图片文件: {:?}", file_path);
+        return None;
+    }
+
+    tracing::info!("[live_monitor] 报告图片已保存: {:?} ({} bytes)", file_path, bytes.len());
+    Some(file_path.to_string_lossy().to_string())
 }
 
 /// 处理今日查询：优先尝试 API 获取图片，失败则回退到文本
 /// 返回 (image_url 或 text, 是否是图片)
 pub fn handle_daily_query(room_id: u64, name: &str) -> (String, bool) {
-    // 先尝试 API 生成图片
     let data = build_daily_report_data(room_id, name);
-    if let Some(image_url) = request_report_image(&data) {
+    if let Some(image_url) = request_report_image(&data, "/api/report/daily") {
         return (image_url, true);
     }
-    // API 失败或无配置，回退到文本
     let text = format_today_report(room_id, name);
     (text, false)
+}
+
+/// 处理周报查询：请求 API /api/report/weekly 生成图片，
+/// 返回 (image_url 或空文本, 是否成功)
+pub fn handle_weekly_query(room_id: u64, name: &str) -> (String, bool) {
+    let data = build_weekly_report_data(room_id, name);
+    if let Some(image_url) = request_report_image(&data, "/api/report/weekly") {
+        return (image_url, true);
+    }
+    (String::new(), false)
+}
+
+/// 处理月报查询：请求 API /api/report/monthly 生成图片，
+/// 返回 (image_url 或空文本, 是否成功)
+pub fn handle_monthly_query(room_id: u64, name: &str) -> (String, bool) {
+    let data = build_monthly_report_data(room_id, name);
+    if let Some(image_url) = request_report_image(&data, "/api/report/monthly") {
+        return (image_url, true);
+    }
+    (String::new(), false)
+}
+
+/// 处理年报查询：请求 API /api/report/yearly 生成图片，
+/// 返回 (image_url 或空文本, 是否成功)
+pub fn handle_yearly_query(room_id: u64, name: &str) -> (String, bool) {
+    let data = build_yearly_report_data(room_id, name);
+    if let Some(image_url) = request_report_image(&data, "/api/report/yearly") {
+        return (image_url, true);
+    }
+    (String::new(), false)
 }
 
 /// 格式化今日直播报告文本（供指令回退使用）

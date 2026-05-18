@@ -3,3 +3,5 @@ target/
 /src/test.rs
 
 Cargo.lock
+
+data/
