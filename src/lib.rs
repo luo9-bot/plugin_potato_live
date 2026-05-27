@@ -22,15 +22,7 @@ pub fn handle_group_msg(group_id: u64, _user_id: u64, msg: &str) {
                 _ => return,
             };
             if success {
-                let label = match report_type {
-                    "weekly" => format!("📊 {}周报", room.name),
-                    "monthly" => format!("📊 {}月报", room.name),
-                    "yearly" => format!("📊 {}年报", room.name),
-                    _ => format!("📊 {}报表", room.name),
-                };
-                let image_msg = Msg::txt(&label).endl()
-                    .image(&result)
-                    .build();
+                let image_msg = Msg::image(&result).build();
                 let _ = Bot::send_group_msg(group_id, image_msg);
             } else {
                 let _ = Bot::send_group_msg(group_id, CString::new("报表生成失败，请稍后再试").unwrap());

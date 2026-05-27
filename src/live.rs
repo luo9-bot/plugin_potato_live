@@ -1611,12 +1611,10 @@ fn push_to_all_groups(msg: &str) {
     }
 }
 
-fn push_report_image_to_all_groups(image_url: &str, label: &str) {
+fn push_report_image_to_all_groups(image_url: &str) {
     let config = CONFIG.get().expect("CONFIG not initialized");
     for &group_id in &config.push_groups {
-        let image_msg = Msg::txt(label).endl()
-            .image(image_url)
-            .build();
+        let image_msg = Msg::image(image_url).build();
         let _ = Bot::send_group_msg(group_id, image_msg);
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -1634,13 +1632,7 @@ fn handle_scheduled_report(room_id: u64, name: &str, report_type: &str) {
     };
 
     if success {
-        let label = match report_type {
-            "weekly" => format!("📊 {}周报", name),
-            "monthly" => format!("📊 {}月报", name),
-            "yearly" => format!("📊 {}年报", name),
-            _ => format!("📊 {}报表", name),
-        };
-        push_report_image_to_all_groups(&result, &label);
+        push_report_image_to_all_groups(&result);
         tracing::info!("[live_monitor] 定时报表已推送: {} - {}", name, report_type);
     } else {
         tracing::warn!("[live_monitor] 定时报表生成失败: {} - {}", name, report_type);
