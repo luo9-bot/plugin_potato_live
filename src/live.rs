@@ -42,9 +42,10 @@ pub struct LiveMonitorConfig {
     /// 内部会自动拼接路径，如 /api/report/daily, /api/report/weekly 等
     #[serde(default)]
     pub report_api_url: Option<String>,
-    /// 头像 URL，传递给报告 API 用于绘图（可选）
+    /// 头像，传递给报告 API 用于绘图（可选）
+    /// 支持 URL 格式或 Base64 格式 (data:image/...;base64,...)
     #[serde(default)]
-    pub avatar_url: Option<String>,
+    pub avatar: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -93,7 +94,7 @@ impl Default for LiveMonitorConfig {
             push_on_start: true,
             push_on_end: false,
             report_api_url: None,
-            avatar_url: None,
+            avatar: None,
         }
     }
 }
@@ -113,8 +114,9 @@ push_on_end: false           # 下播推送（含详细统计）
 # 报告 API 基础地址（可选，不填则日报回退到文本模式）
 # report_api_url: "https://your-api.example.com"
 
-# 头像 URL，传递给报告 API 用于绘图（可选）
-# avatar_url: ""
+# 头像，传递给报告 API 用于绘图（可选）
+# 支持 URL 格式或 Base64 格式 (data:image/...;base64,...)
+# avatar: ""
 "#;
 
 // ── 数据模型 ──────────────────────────────────────────────
@@ -1232,6 +1234,53 @@ pub fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
     })
 }
 
+/// 下载图片 URL 并转换为 base64 格式
+/// 返回 "data:image/...;base64,..." 格式的字符串
+fn download_and_encode_base64(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use base64::Engine;
+
+    tracing::debug!("[live_monitor] 开始下载头像: {}", url);
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(url)
+        .header("User-Agent", "PotatoLiveBot/1.0")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()?;
+
+    let status = resp.status();
+    tracing::debug!("[live_monitor] 头像下载响应状态: {}", status);
+
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status).into());
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .to_string();
+
+    tracing::debug!("[live_monitor] 头像 Content-Type: {}", content_type);
+
+    let bytes = resp.bytes()?;
+    tracing::debug!("[live_monitor] 头像下载完成，大小: {} bytes", bytes.len());
+
+    // 如果 content-type 不包含 image/，默认使用 image/png
+    let mime = if content_type.starts_with("image/") {
+        content_type
+    } else {
+        tracing::warn!("[live_monitor] 头像 Content-Type 非图片格式: {}，使用默认 image/png", content_type);
+        "image/png".to_string()
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let result = format!("data:{};base64,{}", mime, encoded);
+    tracing::debug!("[live_monitor] 头像 base64 编码完成，长度: {} 字符", result.len());
+    Ok(result)
+}
+
 /// 发送报告数据到 API 并保存返回的 PNG 图片到本地
 /// `endpoint` 示例: "/api/report/weekly", "/api/report/monthly"
 /// 返回图片的本地文件路径，或 None（API 未配置 / 请求失败）
@@ -1242,16 +1291,41 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
         None => return None,
     };
 
-    // 注入 avatar_url（如果配置了）
-    let data = if let Some(avatar) = &config.avatar_url {
+    // 注入 avatar（如果配置了）
+    let data = if let Some(avatar_config) = &config.avatar {
+        tracing::debug!("[live_monitor] 配置的 avatar 值: {}",
+            if avatar_config.len() > 100 {
+                format!("{}...(长度: {})", &avatar_config[..100], avatar_config.len())
+            } else {
+                avatar_config.clone()
+            });
+
         let mut data = data.clone();
-        data["avatar_url"] = serde_json::Value::String(avatar.clone());
+        // 如果已经是 base64 格式，直接使用；否则尝试下载并转换为 base64
+        let avatar_value = if avatar_config.starts_with("data:") {
+            tracing::debug!("[live_monitor] avatar 已是 base64 格式，直接使用");
+            avatar_config.clone()
+        } else {
+            // URL 格式，尝试下载并转换为 base64
+            tracing::debug!("[live_monitor] avatar 是 URL 格式，尝试下载并转换为 base64");
+            match download_and_encode_base64(avatar_config) {
+                Ok(base64_str) => base64_str,
+                Err(e) => {
+                    tracing::warn!("[live_monitor] 头像下载/编码失败，使用原始 URL: {}", e);
+                    avatar_config.clone()
+                }
+            }
+        };
+        data["avatar"] = serde_json::Value::String(avatar_value);
         data
     } else {
+        tracing::debug!("[live_monitor] 未配置 avatar");
         data.clone()
     };
 
     let api_url = format!("{}{}", base_url, endpoint);
+    tracing::debug!("[live_monitor] 请求报告 API: {}", api_url);
+    tracing::debug!("[live_monitor] 请求体: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
 
     let client = Client::new();
     let resp = match client
@@ -1261,21 +1335,40 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
         .json(&data)
         .send()
     {
-        Ok(r) => r,
+        Ok(r) => {
+            tracing::debug!("[live_monitor] API 请求已发送，等待响应...");
+            r
+        },
         Err(e) => {
             tracing::warn!("[live_monitor] 报告 API 请求失败: {} -> {}", api_url, e);
             return None;
         }
     };
 
-    if !resp.status().is_success() {
-        tracing::warn!("[live_monitor] 报告 API 返回非成功: {} -> {}", api_url, resp.status());
+    let status = resp.status();
+    let content_type = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    tracing::debug!("[live_monitor] API 响应状态: {}", status);
+    tracing::debug!("[live_monitor] API 响应 Content-Type: {}", content_type);
+
+    if !status.is_success() {
+        tracing::warn!("[live_monitor] 报告 API 返回非成功: {} -> {}", api_url, status);
+        // 尝试读取错误响应体
+        if let Ok(body) = resp.text() {
+            tracing::warn!("[live_monitor] 错误响应体: {}", body);
+        }
         return None;
     }
 
     // API 返回 PNG 二进制流，直接保存到本地
     let bytes = match resp.bytes() {
-        Ok(b) => b,
+        Ok(b) => {
+            tracing::debug!("[live_monitor] 响应体读取完成，大小: {} bytes", b.len());
+            b
+        },
         Err(e) => {
             tracing::warn!("[live_monitor] 读取响应体失败: {}", e);
             return None;
@@ -1285,6 +1378,16 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
     if bytes.is_empty() {
         tracing::warn!("[live_monitor] 报告 API 返回空响应体");
         return None;
+    }
+
+    // 检查 PNG 文件头
+    if bytes.len() >= 8 {
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        if bytes[..8] == png_header {
+            tracing::debug!("[live_monitor] 响应体是有效的 PNG 格式");
+        } else {
+            tracing::warn!("[live_monitor] 响应体不是 PNG 格式，文件头: {:02X?}", &bytes[..8.min(bytes.len())]);
+        }
     }
 
     // 生成文件名：report_{endpoint}_{timestamp}.png
