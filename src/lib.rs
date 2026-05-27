@@ -6,13 +6,32 @@ pub mod path;
 
 use luo9_sdk::Bot;
 use luo9_sdk::Msg;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Mutex;
+use std::time::Instant;
+
+static REPORT_COOLDOWN: Lazy<Mutex<HashMap<&'static str, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn handle_group_msg(group_id: u64, _user_id: u64, msg: &str) {
     let msg_trimmed = msg.trim();
 
     // 定时报表查询指令
     if let Some(report_type) = is_report_query(msg_trimmed) {
+        // 冷却检查：每个报表类型 60 秒内不可重复触发
+        {
+            let mut cooldown = REPORT_COOLDOWN.lock().unwrap();
+            if let Some(last) = cooldown.get(report_type) {
+                if last.elapsed().as_secs() < 60 {
+                    let _ = Bot::send_group_msg(group_id, CString::new("操作过于频繁，请稍后再试").unwrap());
+                    return;
+                }
+            }
+            cooldown.insert(report_type, Instant::now());
+        }
+
         let rooms = live::LiveMonitorConfig::rooms();
         if let Some(room) = rooms.first() {
             let (result, success) = match report_type {
