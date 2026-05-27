@@ -1234,7 +1234,8 @@ pub fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
     })
 }
 
-/// 解析 data:image/...;base64,... 格式的字符串，返回 (bytes, mime_type)
+/// 解析 data:image/...;base64,... 格式的字符串，返回 PNG 格式的 (bytes, mime_type)
+/// 自动将 webp 等格式转换为 PNG
 fn parse_data_url(data_url: &str) -> Option<(Vec<u8>, String)> {
     use base64::Engine;
 
@@ -1245,10 +1246,25 @@ fn parse_data_url(data_url: &str) -> Option<(Vec<u8>, String)> {
     let base64_part = without_prefix[semicolon_pos + 1..].strip_prefix("base64,")?;
 
     let bytes = base64::engine::general_purpose::STANDARD.decode(base64_part).ok()?;
-    Some((bytes, mime))
+
+    // 如果是 PNG 格式，直接返回
+    if mime == "image/png" {
+        return Some((bytes, "image/png".to_string()));
+    }
+
+    // 其他格式转换为 PNG
+    tracing::debug!("[live_monitor] data URL 格式 {} 需要转换为 PNG", mime);
+    match convert_to_png(&bytes) {
+        Ok(png_bytes) => Some((png_bytes, "image/png".to_string())),
+        Err(e) => {
+            tracing::warn!("[live_monitor] data URL 图片转换失败: {}，使用原始格式", e);
+            Some((bytes, mime))
+        }
+    }
 }
 
-/// 下载图片并返回 (bytes, mime_type)
+/// 下载图片并返回 PNG 格式的 (bytes, mime_type)
+/// 自动将 webp 等格式转换为 PNG（Satori 不支持 webp）
 fn download_image(url: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     tracing::debug!("[live_monitor] 开始下载头像: {}", url);
 
@@ -1278,15 +1294,37 @@ fn download_image(url: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Er
     let bytes = resp.bytes()?.to_vec();
     tracing::debug!("[live_monitor] 头像下载完成，大小: {} bytes", bytes.len());
 
-    // 如果 content-type 不包含 image/，默认使用 image/png
-    let mime = if content_type.starts_with("image/") {
-        content_type
-    } else {
-        tracing::warn!("[live_monitor] 头像 Content-Type 非图片格式: {}，使用默认 image/png", content_type);
-        "image/png".to_string()
-    };
+    // 如果是 PNG 格式，直接返回
+    if content_type == "image/png" {
+        return Ok((bytes, "image/png".to_string()));
+    }
 
-    Ok((bytes, mime))
+    // 其他格式（webp, jpeg 等）转换为 PNG
+    tracing::debug!("[live_monitor] 头像格式 {} 需要转换为 PNG", content_type);
+    match convert_to_png(&bytes) {
+        Ok(png_bytes) => {
+            tracing::debug!("[live_monitor] 图片转换为 PNG 完成，大小: {} bytes", png_bytes.len());
+            Ok((png_bytes, "image/png".to_string()))
+        }
+        Err(e) => {
+            tracing::warn!("[live_monitor] 图片转换失败: {}，使用原始格式", e);
+            let mime = if content_type.starts_with("image/") {
+                content_type
+            } else {
+                "image/png".to_string()
+            };
+            Ok((bytes, mime))
+        }
+    }
+}
+
+/// 将图片字节转换为 PNG 格式
+fn convert_to_png(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let img = image::load_from_memory(bytes)?;
+    let mut png_bytes: Vec<u8> = Vec::new();
+    let cursor = std::io::Cursor::new(&mut png_bytes);
+    img.write_to(cursor, image::ImageFormat::Png)?;
+    Ok(png_bytes)
 }
 
 /// 发送报告数据到 API 并保存返回的 PNG 图片到本地
