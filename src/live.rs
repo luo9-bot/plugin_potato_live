@@ -42,6 +42,9 @@ pub struct LiveMonitorConfig {
     /// 内部会自动拼接路径，如 /api/report/daily, /api/report/weekly 等
     #[serde(default)]
     pub report_api_url: Option<String>,
+    /// 头像 URL，传递给报告 API 用于绘图（可选）
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +93,7 @@ impl Default for LiveMonitorConfig {
             push_on_start: true,
             push_on_end: false,
             report_api_url: None,
+            avatar_url: None,
         }
     }
 }
@@ -108,6 +112,9 @@ push_on_end: false           # 下播推送（含详细统计）
 
 # 报告 API 基础地址（可选，不填则日报回退到文本模式）
 # report_api_url: "https://your-api.example.com"
+
+# 头像 URL，传递给报告 API 用于绘图（可选）
+# avatar_url: ""
 "#;
 
 // ── 数据模型 ──────────────────────────────────────────────
@@ -1235,6 +1242,15 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
         None => return None,
     };
 
+    // 注入 avatar_url（如果配置了）
+    let data = if let Some(avatar) = &config.avatar_url {
+        let mut data = data.clone();
+        data["avatar_url"] = serde_json::Value::String(avatar.clone());
+        data
+    } else {
+        data.clone()
+    };
+
     let api_url = format!("{}{}", base_url, endpoint);
 
     let client = Client::new();
@@ -1242,7 +1258,7 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
         .post(&api_url)
         .header("Content-Type", "application/json")
         .header("User-Agent", "PotatoLiveBot/1.0")
-        .json(data)
+        .json(&data)
         .send()
     {
         Ok(r) => r,
