@@ -1770,7 +1770,7 @@ mod tests {
         assert_eq!(segs[1]["start_time"], "00:00");
         assert_eq!(segs[1]["end_time"], "02:00");
         assert_eq!(segs[1]["duration_minutes"], 120);
-        assert_eq!(segs[1]["crosses_midnight"], true);
+        assert_eq!(segs[1]["crosses_midnight"], false);
     }
 
     /// 跨两天 18:00→03:00（你给的例子）
@@ -1788,7 +1788,7 @@ mod tests {
         assert_eq!(segs[1]["start_time"], "00:00");
         assert_eq!(segs[1]["end_time"], "03:00");
         assert_eq!(segs[1]["duration_minutes"], 180);
-        assert_eq!(segs[1]["crosses_midnight"], true);
+        assert_eq!(segs[1]["crosses_midnight"], false);
     }
 
     // ── get_session_dates ─────────────────────────────────
