@@ -11,6 +11,36 @@ use std::ffi::CString;
 pub fn handle_group_msg(group_id: u64, _user_id: u64, msg: &str) {
     let msg_trimmed = msg.trim();
 
+    // 定时报表查询指令
+    if let Some(report_type) = is_report_query(msg_trimmed) {
+        let rooms = live::LiveMonitorConfig::rooms();
+        if let Some(room) = rooms.first() {
+            let (result, success) = match report_type {
+                "weekly" => live::handle_weekly_query(room.room_id, &room.name),
+                "monthly" => live::handle_monthly_query(room.room_id, &room.name),
+                "yearly" => live::handle_yearly_query(room.room_id, &room.name),
+                _ => return,
+            };
+            if success {
+                let label = match report_type {
+                    "weekly" => format!("📊 {}周报", room.name),
+                    "monthly" => format!("📊 {}月报", room.name),
+                    "yearly" => format!("📊 {}年报", room.name),
+                    _ => format!("📊 {}报表", room.name),
+                };
+                let image_msg = Msg::txt(&label).endl()
+                    .image(&result)
+                    .build();
+                let _ = Bot::send_group_msg(group_id, image_msg);
+            } else {
+                let _ = Bot::send_group_msg(group_id, CString::new("报表生成失败，请稍后再试").unwrap());
+            }
+        } else {
+            let _ = Bot::send_group_msg(group_id, CString::new("暂无配置的直播间").unwrap());
+        }
+        return;
+    }
+
     // 模糊匹配"土豆今天直播了没"及其变体
     if is_live_query(msg_trimmed) {
         let rooms = live::LiveMonitorConfig::rooms();
@@ -63,6 +93,26 @@ fn is_live_query(msg: &str) -> bool {
     }
 
     true
+}
+
+/// 判断是否为定时报表查询指令
+/// 支持：土豆周报/月报/年报、🥔周报/月报/年报
+fn is_report_query(msg: &str) -> Option<&'static str> {
+    let patterns: &[(&str, &str)] = &[
+        ("土豆周报", "weekly"),
+        ("土豆月报", "monthly"),
+        ("土豆年报", "yearly"),
+        ("\u{1f954}周报", "weekly"),
+        ("\u{1f954}月报", "monthly"),
+        ("\u{1f954}年报", "yearly"),
+    ];
+
+    for &(pattern, report_type) in patterns {
+        if msg.contains(pattern) {
+            return Some(report_type);
+        }
+    }
+    None
 }
 
 fn handle_task_event(json: &str) {
@@ -134,6 +184,45 @@ mod tests {
     #[test]
     fn test_query_empty() {
         assert!(!is_live_query(""));
+    }
+
+    // ── is_report_query ────────────────────────────────────
+
+    #[test]
+    fn test_report_weekly_cn() {
+        assert_eq!(is_report_query("土豆周报"), Some("weekly"));
+    }
+
+    #[test]
+    fn test_report_monthly_cn() {
+        assert_eq!(is_report_query("土豆月报"), Some("monthly"));
+    }
+
+    #[test]
+    fn test_report_yearly_cn() {
+        assert_eq!(is_report_query("土豆年报"), Some("yearly"));
+    }
+
+    #[test]
+    fn test_report_weekly_emoji() {
+        assert_eq!(is_report_query("\u{1f954}周报"), Some("weekly"));
+    }
+
+    #[test]
+    fn test_report_monthly_emoji() {
+        assert_eq!(is_report_query("\u{1f954}月报"), Some("monthly"));
+    }
+
+    #[test]
+    fn test_report_yearly_emoji() {
+        assert_eq!(is_report_query("\u{1f954}年报"), Some("yearly"));
+    }
+
+    #[test]
+    fn test_report_no_match() {
+        assert_eq!(is_report_query("土豆直播"), None);
+        assert_eq!(is_report_query("你好"), None);
+        assert_eq!(is_report_query(""), None);
     }
 }
 

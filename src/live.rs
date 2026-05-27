@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use luo9_sdk::Bot;
+use luo9_sdk::Msg;
 use luo9_sdk::bus::Bus;
 use reqwest::blocking::Client;
 
@@ -199,6 +200,7 @@ fn register_schedule_tasks() {
     let config = CONFIG.get().expect("CONFIG not initialized");
 
     for room in &config.rooms {
+        // 直播状态检测（每分钟）
         let req = serde_json::json!({
             "action": "schedule",
             "task_name": format!("bilibili_live_{}", room.room_id),
@@ -213,6 +215,33 @@ fn register_schedule_tasks() {
             "[live_monitor] 已注册定时任务: {} ({})",
             room.name, room.room_id
         );
+
+        // ── 定时报表任务 ──
+        let report_tasks: &[(&str, &str)] = &[
+            ("report_weekly",  "0 0 22 * * 0"),   // 每周日 22:00
+            ("report_monthly", "0 0 22 L * *"),    // 每月最后一天 22:00
+            ("report_yearly",  "0 0 22 31 12 *"),  // 每年 12月31日 22:00
+        ];
+
+        for &(prefix, cron) in report_tasks {
+            let task_name = format!("{}_{}", prefix, room.room_id);
+            let report_type = prefix.strip_prefix("report_").unwrap_or(prefix);
+            let req = serde_json::json!({
+                "action": "schedule",
+                "task_name": task_name,
+                "cron": cron,
+                "payload": serde_json::json!({
+                    "room_id": room.room_id,
+                    "name": room.name,
+                    "report_type": report_type
+                }).to_string()
+            });
+            let _ = Bus::topic("luo9_task_miso").publish(&req.to_string());
+            tracing::info!(
+                "[live_monitor] 已注册定时报表任务: {} ({}) - {}",
+                room.name, room.room_id, report_type
+            );
+        }
     }
 }
 
@@ -233,6 +262,16 @@ pub fn handle_task_event(json: &str) {
         let name = payload["name"].as_str().unwrap_or("unknown").to_string();
 
         check_and_notify(room_id, &name);
+    } else if task_name.starts_with("report_") {
+        let payload_str = event["payload"].as_str().unwrap_or("");
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_str) else {
+            return;
+        };
+        let room_id = payload["room_id"].as_u64().unwrap_or(0);
+        let name = payload["name"].as_str().unwrap_or("unknown");
+        let report_type = payload["report_type"].as_str().unwrap_or("");
+
+        handle_scheduled_report(room_id, name, report_type);
     }
 }
 
@@ -1569,6 +1608,42 @@ fn push_to_all_groups(msg: &str) {
     for &group_id in &config.push_groups {
         let _ = Bot::send_group_msg(group_id, CString::new(msg).unwrap());
         std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn push_report_image_to_all_groups(image_url: &str, label: &str) {
+    let config = CONFIG.get().expect("CONFIG not initialized");
+    for &group_id in &config.push_groups {
+        let image_msg = Msg::txt(label).endl()
+            .image(image_url)
+            .build();
+        let _ = Bot::send_group_msg(group_id, image_msg);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn handle_scheduled_report(room_id: u64, name: &str, report_type: &str) {
+    let (result, success) = match report_type {
+        "weekly" => handle_weekly_query(room_id, name),
+        "monthly" => handle_monthly_query(room_id, name),
+        "yearly" => handle_yearly_query(room_id, name),
+        _ => {
+            tracing::warn!("[live_monitor] 未知报表类型: {}", report_type);
+            return;
+        }
+    };
+
+    if success {
+        let label = match report_type {
+            "weekly" => format!("📊 {}周报", name),
+            "monthly" => format!("📊 {}月报", name),
+            "yearly" => format!("📊 {}年报", name),
+            _ => format!("📊 {}报表", name),
+        };
+        push_report_image_to_all_groups(&result, &label);
+        tracing::info!("[live_monitor] 定时报表已推送: {} - {}", name, report_type);
+    } else {
+        tracing::warn!("[live_monitor] 定时报表生成失败: {} - {}", name, report_type);
     }
 }
 
