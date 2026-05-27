@@ -606,7 +606,17 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
 fn parse_datetime(s: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
-        .map(|dt| dt.with_timezone(&Local))
+        .map(|dt| {
+            // 如果是 UTC 时间（+00:00），转换为北京时间（+08:00）
+            let offset_secs = dt.offset().local_minus_utc();
+            if offset_secs == 0 {
+                // UTC 时间，使用固定偏移 +08:00
+                let fixed_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+                dt.with_timezone(&fixed_offset).with_timezone(&Local)
+            } else {
+                dt.with_timezone(&Local)
+            }
+        })
 }
 
 /// 格式化平均开播时间
