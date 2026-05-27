@@ -1234,11 +1234,22 @@ pub fn build_daily_report_data(room_id: u64, name: &str) -> serde_json::Value {
     })
 }
 
-/// 下载图片 URL 并转换为 base64 格式
-/// 返回 "data:image/...;base64,..." 格式的字符串
-fn download_and_encode_base64(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// 解析 data:image/...;base64,... 格式的字符串，返回 (bytes, mime_type)
+fn parse_data_url(data_url: &str) -> Option<(Vec<u8>, String)> {
     use base64::Engine;
 
+    // 格式: data:image/png;base64,iVBORw0KGgo...
+    let without_prefix = data_url.strip_prefix("data:")?;
+    let semicolon_pos = without_prefix.find(';')?;
+    let mime = without_prefix[..semicolon_pos].to_string();
+    let base64_part = without_prefix[semicolon_pos + 1..].strip_prefix("base64,")?;
+
+    let bytes = base64::engine::general_purpose::STANDARD.decode(base64_part).ok()?;
+    Some((bytes, mime))
+}
+
+/// 下载图片并返回 (bytes, mime_type)
+fn download_image(url: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     tracing::debug!("[live_monitor] 开始下载头像: {}", url);
 
     let client = reqwest::blocking::Client::new();
@@ -1264,7 +1275,7 @@ fn download_and_encode_base64(url: &str) -> Result<String, Box<dyn std::error::E
 
     tracing::debug!("[live_monitor] 头像 Content-Type: {}", content_type);
 
-    let bytes = resp.bytes()?;
+    let bytes = resp.bytes()?.to_vec();
     tracing::debug!("[live_monitor] 头像下载完成，大小: {} bytes", bytes.len());
 
     // 如果 content-type 不包含 image/，默认使用 image/png
@@ -1275,10 +1286,7 @@ fn download_and_encode_base64(url: &str) -> Result<String, Box<dyn std::error::E
         "image/png".to_string()
     };
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let result = format!("data:{};base64,{}", mime, encoded);
-    tracing::debug!("[live_monitor] 头像 base64 编码完成，长度: {} 字符", result.len());
-    Ok(result)
+    Ok((bytes, mime))
 }
 
 /// 发送报告数据到 API 并保存返回的 PNG 图片到本地
@@ -1291,8 +1299,20 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
         None => return None,
     };
 
-    // 注入 avatar（如果配置了）
-    let data = if let Some(avatar_config) = &config.avatar {
+    // 移除 data 中的 avatar 字段（如果有），头像将通过 multipart 单独上传
+    let mut data = data.clone();
+    data.as_object_mut().map(|m| m.remove("avatar"));
+
+    let api_url = format!("{}{}", base_url, endpoint);
+    tracing::debug!("[live_monitor] 请求报告 API: {}", api_url);
+    tracing::debug!("[live_monitor] 请求体: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
+
+    // 构建 multipart/form-data
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .text("data", serde_json::to_string(&data).unwrap_or_default());
+
+    // 处理头像：下载图片并作为文件上传
+    if let Some(avatar_config) = &config.avatar {
         tracing::debug!("[live_monitor] 配置的 avatar 值: {}",
             if avatar_config.len() > 100 {
                 format!("{}...(长度: {})", &avatar_config[..100], avatar_config.len())
@@ -1300,39 +1320,43 @@ fn request_report_image(data: &serde_json::Value, endpoint: &str) -> Option<Stri
                 avatar_config.clone()
             });
 
-        let mut data = data.clone();
-        // 如果已经是 base64 格式，直接使用；否则尝试下载并转换为 base64
-        let avatar_value = if avatar_config.starts_with("data:") {
-            tracing::debug!("[live_monitor] avatar 已是 base64 格式，直接使用");
-            avatar_config.clone()
-        } else {
-            // URL 格式，尝试下载并转换为 base64
-            tracing::debug!("[live_monitor] avatar 是 URL 格式，尝试下载并转换为 base64");
-            match download_and_encode_base64(avatar_config) {
-                Ok(base64_str) => base64_str,
-                Err(e) => {
-                    tracing::warn!("[live_monitor] 头像下载/编码失败，使用原始 URL: {}", e);
-                    avatar_config.clone()
+        if avatar_config.starts_with("data:") {
+            // 已经是 base64 格式，解析并作为文件上传
+            tracing::debug!("[live_monitor] avatar 是 base64 格式，解析并上传");
+            if let Some((bytes, mime)) = parse_data_url(avatar_config) {
+                let part = reqwest::blocking::multipart::Part::bytes(bytes)
+                    .file_name("avatar.png")
+                    .mime_str(&mime).ok();
+                if let Some(part) = part {
+                    form = form.part("avatar", part);
                 }
             }
-        };
-        data["avatar"] = serde_json::Value::String(avatar_value);
-        data
+        } else {
+            // URL 格式，下载图片并作为文件上传
+            tracing::debug!("[live_monitor] avatar 是 URL 格式，下载并上传");
+            match download_image(avatar_config) {
+                Ok((bytes, mime)) => {
+                    let part = reqwest::blocking::multipart::Part::bytes(bytes)
+                        .file_name("avatar.png")
+                        .mime_str(&mime).ok();
+                    if let Some(part) = part {
+                        form = form.part("avatar", part);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[live_monitor] 头像下载失败: {}", e);
+                }
+            }
+        }
     } else {
         tracing::debug!("[live_monitor] 未配置 avatar");
-        data.clone()
-    };
-
-    let api_url = format!("{}{}", base_url, endpoint);
-    tracing::debug!("[live_monitor] 请求报告 API: {}", api_url);
-    tracing::debug!("[live_monitor] 请求体: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
+    }
 
     let client = Client::new();
     let resp = match client
         .post(&api_url)
-        .header("Content-Type", "application/json")
         .header("User-Agent", "PotatoLiveBot/1.0")
-        .json(&data)
+        .multipart(form)
         .send()
     {
         Ok(r) => {

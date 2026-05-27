@@ -7,6 +7,13 @@ use std::path::PathBuf;
 
 use plugin_potato_live::live;
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+}
+
 /// 测试用的房间 ID
 const TEST_ROOM_ID: u64 = 13160979;
 
@@ -56,6 +63,8 @@ fn test_api_handlers() {
 
     let data_dir = PathBuf::from("data").join("plugin_potato_live");
     fs::create_dir_all(&data_dir).expect("无法创建数据目录");
+
+    init_tracing();
 
     println!("📂 准备测试数据...");
 
