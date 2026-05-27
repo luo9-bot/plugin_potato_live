@@ -1,6 +1,6 @@
 [package]
 name = "plugin_potato_live"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "bilibili直播检测: 土豆，今天直播了没?"
 
