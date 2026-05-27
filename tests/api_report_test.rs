@@ -3,58 +3,12 @@
 // 生成的 PNG 图片将复制到 target/test_output/ 目录
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 
 use plugin_potato_live::live;
 
 /// 测试用的房间 ID
 const TEST_ROOM_ID: u64 = 13160979;
-
-fn get_mock_sessions_jsonl() -> Vec<&'static str> {
-    vec![
-        r#"{"room_id":13160979,"start":"2026-05-14T09:56:00.825296639+08:00","end":"2026-05-14T14:19:00.636183118+08:00","duration_secs":15779,"weekday":3,"start_hour":9,"end_hour":14}"#,
-        r#"{"room_id":13160979,"start":"2026-05-15T10:13:00.295659940+08:00","end":"2026-05-15T15:24:00.272495576+08:00","duration_secs":18659,"weekday":4,"start_hour":10,"end_hour":15}"#,
-        r#"{"room_id":13160979,"start":"2026-05-16T12:35:01.054997753+08:00","end":"2026-05-16T15:57:01.097099645+08:00","duration_secs":12120,"weekday":5,"start_hour":12,"end_hour":15}"#,
-        r#"{"room_id":13160979,"start":"2026-05-18T10:15:01.035196505+08:00","end":"2026-05-18T14:04:01.059786791+08:00","duration_secs":13740,"weekday":0,"start_hour":10,"end_hour":14}"#,
-        r#"{"room_id":13160979,"start":"2026-05-18T19:00:00+08:00","end":"2026-05-19T02:00:00+08:00","duration_secs":25200,"weekday":0,"start_hour":19,"end_hour":2}"#,
-        r#"{"room_id":13160979,"start":"2026-04-30T22:00:00+08:00","end":"2026-05-01T03:00:00+08:00","duration_secs":18000,"weekday":3,"start_hour":22,"end_hour":3}"#,
-    ]
-}
-
-fn write_sessions_file(data_dir: &PathBuf) {
-    let path = data_dir.join(format!("sessions_{}.json", TEST_ROOM_ID));
-    let mut file = fs::OpenOptions::new()
-        .create(true).write(true).truncate(true)
-        .open(&path).expect("无法创建 sessions 文件");
-    for line in get_mock_sessions_jsonl() {
-        writeln!(file, "{}", line).expect("写入失败");
-    }
-    println!("  ✓ 写入 sessions 文件");
-}
-
-fn write_runtime_state_file(data_dir: &PathBuf) {
-    let path = data_dir.join(format!("runtime_state_{}.json", TEST_ROOM_ID));
-    fs::write(&path, r#"{"room_id":13160979,"is_live":false,"current_start":null,"consecutive_failures":0}"#)
-        .expect("无法写入 runtime_state");
-    println!("  ✓ 写入 runtime_state 文件");
-}
-
-fn write_config(data_dir: &PathBuf) {
-    let path = data_dir.join("config.yaml");
-    fs::write(&path, format!(r#"
-admin: 123456
-rooms:
-  - room_id: {}
-    name: "土豆"
-push_groups:
-  - 123456789
-push_on_start: true
-push_on_end: false
-report_api_url: ""
-"#, TEST_ROOM_ID)).expect("无法写入 config");
-    println!("  ✓ 写入 config 文件");
-}
 
 fn save_json(name: &str, json: &serde_json::Value) {
     let out = PathBuf::from("target").join("test_output");
@@ -104,9 +58,6 @@ fn test_api_handlers() {
     fs::create_dir_all(&data_dir).expect("无法创建数据目录");
 
     println!("📂 准备测试数据...");
-    write_sessions_file(&data_dir);
-    write_runtime_state_file(&data_dir);
-    // write_config(&data_dir);
 
     println!("\n🔧 初始化模块...");
     live::init();
