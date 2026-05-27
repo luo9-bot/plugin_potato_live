@@ -603,20 +603,25 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
         .map(|dt| dt.date_naive())
 }
 
+/// 获取北京时间的固定偏移 (+08:00)
+fn beijing_offset() -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(8 * 3600).unwrap()
+}
+
 fn parse_datetime(s: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| {
-            // 如果是 UTC 时间（+00:00），转换为北京时间（+08:00）
-            let offset_secs = dt.offset().local_minus_utc();
-            if offset_secs == 0 {
-                // UTC 时间，使用固定偏移 +08:00
-                let fixed_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-                dt.with_timezone(&fixed_offset).with_timezone(&Local)
-            } else {
-                dt.with_timezone(&Local)
-            }
+            // 统一转换为北京时间（+08:00），然后转为本地时间
+            let beijing_dt = dt.with_timezone(&beijing_offset());
+            beijing_dt.with_timezone(&Local)
         })
+}
+
+/// 将时间格式化为北京时间的 HH:mm 字符串
+fn format_time_to_beijing_string(dt: &DateTime<Local>) -> String {
+    let beijing_dt = dt.with_timezone(&beijing_offset());
+    beijing_dt.format("%H:%M").to_string()
 }
 
 /// 格式化平均开播时间
@@ -683,17 +688,21 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
         None => return Vec::new(),
     };
 
-    let start_date = start_dt.date_naive();
-    let end_date = end_dt.date_naive();
+    // 使用北京时间的日期和时间
+    let beijing_start = start_dt.with_timezone(&beijing_offset());
+    let beijing_end = end_dt.with_timezone(&beijing_offset());
+
+    let start_date = beijing_start.date_naive();
+    let end_date = beijing_end.date_naive();
     let original_crosses = start_date != end_date;
 
     if start_date == end_date {
         // 同一天，无需拆分
-        let start_min = start_dt.hour() as u64 * 60 + start_dt.minute() as u64;
-        let end_min = end_dt.hour() as u64 * 60 + end_dt.minute() as u64;
+        let start_min = beijing_start.hour() as u64 * 60 + beijing_start.minute() as u64;
+        let end_min = beijing_end.hour() as u64 * 60 + beijing_end.minute() as u64;
         return vec![serde_json::json!({
-            "start_time": start_dt.format("%H:%M").to_string(),
-            "end_time": end_dt.format("%H:%M").to_string(),
+            "start_time": format_time_to_beijing_string(&start_dt),
+            "end_time": format_time_to_beijing_string(&end_dt),
             "duration_minutes": end_min - start_min,
             "crosses_midnight": false,
         })];
@@ -703,10 +712,10 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
 
     // 第一天：start → 24:00（标记 crosses_midnight=true，表示原 session 跨日）
     {
-        let start_min = start_dt.hour() as u64 * 60 + start_dt.minute() as u64;
+        let start_min = beijing_start.hour() as u64 * 60 + beijing_start.minute() as u64;
         let day_end_min = 24 * 60;
         segments.push(serde_json::json!({
-            "start_time": start_dt.format("%H:%M").to_string(),
+            "start_time": format_time_to_beijing_string(&start_dt),
             "end_time": "24:00".to_string(),
             "duration_minutes": day_end_min - start_min,
             "crosses_midnight": original_crosses,
@@ -727,10 +736,10 @@ fn split_session_into_segments(session: &LiveSession) -> Vec<serde_json::Value> 
 
     // 最后一天：00:00 → end
     {
-        let end_min = end_dt.hour() as u64 * 60 + end_dt.minute() as u64;
+        let end_min = beijing_end.hour() as u64 * 60 + beijing_end.minute() as u64;
         segments.push(serde_json::json!({
             "start_time": "00:00".to_string(),
-            "end_time": end_dt.format("%H:%M").to_string(),
+            "end_time": format_time_to_beijing_string(&end_dt),
             "duration_minutes": end_min,
             "crosses_midnight": false,
         }));
