@@ -52,27 +52,27 @@ pub fn handle_group_msg(group_id: u64, _user_id: u64, msg: &str) {
         return;
     }
 
-    // 模糊匹配"土豆今天直播了没"及其变体
-    if is_live_query(msg_trimmed) {
-        let rooms = live::LiveMonitorConfig::rooms();
-        if let Some(room) = rooms.first() {
-            let (result, is_image) = live::handle_daily_query(room.room_id, &room.name);
-            if is_image {
-                // API 返回了图片 URL，发送图片消息
-                let image_msg = Msg::txt(&room.name).endl()
-                    .image(&result)
-                    .build();
-                let _ = Bot::send_group_msg(group_id, image_msg);
-            } else {
-                // 回退到文本消息
-                let _ = Bot::send_group_msg(group_id, CString::new(result).unwrap());
-            }
-        } else {
-            let msg = CString::new("暂无配置的直播间").unwrap();
-            let _ = Bot::send_group_msg(group_id, msg);
-        }
-        return;
-    }
+    // // 模糊匹配"土豆今天直播了没"及其变体
+    // if is_live_query(msg_trimmed) {
+    //     let rooms = live::LiveMonitorConfig::rooms();
+    //     if let Some(room) = rooms.first() {
+    //         let (result, is_image) = live::handle_daily_query(room.room_id, &room.name);
+    //         if is_image {
+    //             // API 返回了图片 URL，发送图片消息
+    //             let image_msg = Msg::txt(&room.name).endl()
+    //                 .image(&result)
+    //                 .build();
+    //             let _ = Bot::send_group_msg(group_id, image_msg);
+    //         } else {
+    //             // 回退到文本消息
+    //             let _ = Bot::send_group_msg(group_id, CString::new(result).unwrap());
+    //         }
+    //     } else {
+    //         let msg = CString::new("暂无配置的直播间").unwrap();
+    //         let _ = Bot::send_group_msg(group_id, msg);
+    //     }
+    //     return;
+    // }
 }
 
 /// 判断是否为"土豆今天直播了没"类查询指令（支持模糊匹配和常见变体）
